@@ -1,0 +1,23 @@
+{
+  "name": "d3-force-wasm",
+  "version": "0.0.0",
+  "description": "Drop-in replacement for d3-force v3 with a Zig/WebAssembly core.",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:wasm": "zig build",
+    "test:zig": "zig build test",
+    "test": "node --test test/",
+    "traces": "node scripts/tree-traces.js"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "d3-force": "3.0.0",
+    "d3-quadtree": "3.0.1"
+  }
+}

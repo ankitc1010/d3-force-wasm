@@ -1,0 +1,7 @@
+.{
+    .name = .d3_force_wasm,
+    .version = "0.0.0",
+    .fingerprint = 0x2851099ab66f99da,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
