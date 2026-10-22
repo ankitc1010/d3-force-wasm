@@ -8,7 +8,7 @@ import {readFileSync} from "node:fs";
 import {pointSets, trace, bits, unbits} from "../scripts/tree-traces.js";
 
 const wasm = readFileSync(new URL("../zig-out/bin/core.wasm", import.meta.url));
-const core = new WebAssembly.Instance(new WebAssembly.Module(wasm)).exports;
+const core = new WebAssembly.Instance(new WebAssembly.Module(wasm), {env: {random: Math.random}}).exports;
 const traces = JSON.parse(readFileSync(new URL("./fixtures/tree-traces.json", import.meta.url)));
 const NONE = 0xffffffff;
 

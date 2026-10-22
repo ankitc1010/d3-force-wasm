@@ -6,7 +6,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sim_mod = @import("sim.zig");
 const tree_mod = @import("tree.zig");
+const force_mod = @import("force.zig");
 const Sim = sim_mod.Sim;
+const Force = force_mod.Force;
 
 pub const Status = enum(i32) {
     ok = 0,
@@ -114,6 +116,85 @@ export fn tree_order(h: u32, after: u32, out: u32) i32 {
     if (out == 0) return status(.bad_argument);
     const dst: [*]u32 = @ptrFromInt(out);
     t.order(gpa, after != 0, dst[0..t.len]) catch return status(.out_of_memory);
+    return status(.ok);
+}
+
+/// The force's JS random source (`env.random`); the facade points it at the
+/// running force's `random` before each `force_run`.
+extern "env" fn random() f64;
+
+fn jsRandom() f64 {
+    return random();
+}
+
+export fn force_create(h: u32, kind: u32) u32 {
+    const s = get(h) orelse return 0;
+    const k = std.enums.fromInt(force_mod.Kind, kind) orelse return 0;
+    const f = gpa.create(Force) catch return 0;
+    f.* = .{ .kind = k };
+    if (f.nodeSized()) f.setCount(gpa, s.n) catch {
+        gpa.destroy(f);
+        return 0;
+    };
+    return s.addForce(gpa, f) catch {
+        f.deinit(gpa);
+        gpa.destroy(f);
+        return 0;
+    };
+}
+
+export fn force_destroy(h: u32, fh: u32) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    const f = s.getForce(fh) orelse return status(.bad_handle);
+    f.deinit(gpa);
+    gpa.destroy(f);
+    s.forces[fh - 1] = null;
+    return status(.ok);
+}
+
+/// Resizes the force's arrays to `count` entries (nodes, or links for link).
+/// Existing entries are kept; new float entries are NaN.
+export fn force_set_count(h: u32, fh: u32, count: u32) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    const f = s.getForce(fh) orelse return status(.bad_handle);
+    f.setCount(gpa, count) catch return status(.out_of_memory);
+    return status(.grown);
+}
+
+export fn force_ptr(h: u32, fh: u32, which: u32) u32 {
+    const s = get(h) orelse return 0;
+    const f = s.getForce(fh) orelse return 0;
+    const w = std.enums.fromInt(force_mod.Array, which) orelse return 0;
+    return @intCast(f.ptr(w));
+}
+
+export fn force_set_scalar(h: u32, fh: u32, which: u32, v: f64) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    const f = s.getForce(fh) orelse return status(.bad_handle);
+    if (which >= f.scalars.len) return status(.bad_argument);
+    f.scalars[which] = v;
+    return status(.ok);
+}
+
+export fn force_run(h: u32, fh: u32, alpha: f64) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    const f = s.getForce(fh) orelse return status(.bad_handle);
+    if (f.nodeSized() and f.count < s.n) return status(.bad_argument);
+    switch (f.kind) {
+        .center => @import("simple.zig").center(s, f),
+        .x => @import("simple.zig").axis(s, f, alpha, 0),
+        .y => @import("simple.zig").axis(s, f, alpha, 1),
+        .radial => @import("simple.zig").radial(s, f, alpha),
+        .link => @import("link.zig").run(s, f, alpha, &jsRandom) catch return status(.bad_argument),
+        .many_body => @import("many_body.zig").run(s, gpa, f, alpha, &jsRandom) catch return status(.out_of_memory),
+        .collide => @import("collide.zig").run(s, gpa, f, &jsRandom) catch return status(.out_of_memory),
+    }
+    return status(.ok);
+}
+
+export fn sim_integrate(h: u32, velocity_decay: f64) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    @import("simple.zig").integrate(s, velocity_decay);
     return status(.ok);
 }
 

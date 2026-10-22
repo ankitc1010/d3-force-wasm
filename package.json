@@ -10,10 +10,13 @@
     "node": ">=18"
   },
   "scripts": {
-    "build:wasm": "zig build",
+    "build:wasm": "zig build && node scripts/embed-wasm.js",
+    "pretest": "npm run build:wasm",
     "test:zig": "zig build test",
-    "test": "node --test test/*-test.js",
-    "traces": "node scripts/tree-traces.js"
+    "test": "node --test test/*-test.js && node --import ./test/d3/setup.js --test test/d3/*-test.js",
+    "test:parity": "node --test test/parity/*-test.js",
+    "traces": "node scripts/tree-traces.js",
+    "demo": "npm run build:wasm && node scripts/serve.js"
   },
   "license": "ISC",
   "devDependencies": {

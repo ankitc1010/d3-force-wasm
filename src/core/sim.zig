@@ -4,6 +4,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tree = @import("tree.zig").Tree;
+const Force = @import("force.zig").Force;
+const addr = @import("force.zig").addr;
 
 /// Indices for `sim_ptr`.
 pub const Ptr = enum(u32) { x, y, vx, vy, fx, fy, fixed, perm, rng_buf };
@@ -23,17 +25,30 @@ pub const Sim = struct {
     px: []f64 = &.{},
     py: []f64 = &.{},
     tree: Tree = .{},
+    /// Force handle fh refers to forces[fh - 1]; 0 is never a valid handle.
+    forces: []?*Force = &.{},
 
     pub fn deinit(s: *Sim, a: Allocator) void {
         inline for (.{ "x", "y", "vx", "vy", "fx", "fy", "fixed", "px", "py" }) |f| a.free(@field(s, f));
         s.tree.deinit(a);
+        for (s.forces) |slot| if (slot) |f| {
+            f.deinit(a);
+            a.destroy(f);
+        };
+        a.free(s.forces);
         s.* = .{};
     }
 
     /// Returns true when arrays were reallocated, so views must be refreshed.
+    /// Node-sized force arrays follow the node count, padded with NaN.
     pub fn setNodeCount(s: *Sim, a: Allocator, n: u32) !bool {
         s.n = n;
-        if (n <= s.cap) return false;
+        var grown = false;
+        for (s.forces) |slot| if (slot) |f| if (f.nodeSized() and f.count < n) {
+            try f.setCount(a, n);
+            grown = true;
+        };
+        if (n <= s.cap) return grown;
         const cap = @max(n, s.cap * 2, 16);
         inline for (.{ "x", "y", "vx", "vy", "fx", "fy", "fixed", "px", "py" }) |f| {
             @field(s, f) = try a.realloc(@field(s, f), cap);
@@ -44,20 +59,36 @@ pub const Sim = struct {
 
     pub fn ptr(s: *Sim, which: Ptr) usize {
         return switch (which) {
-            .x => @intFromPtr(s.x.ptr),
-            .y => @intFromPtr(s.y.ptr),
-            .vx => @intFromPtr(s.vx.ptr),
-            .vy => @intFromPtr(s.vy.ptr),
-            .fx => @intFromPtr(s.fx.ptr),
-            .fy => @intFromPtr(s.fy.ptr),
-            .fixed => @intFromPtr(s.fixed.ptr),
-            .perm => @intFromPtr(s.tree.perm.ptr),
+            .x => addr(s.x),
+            .y => addr(s.y),
+            .vx => addr(s.vx),
+            .vy => addr(s.vy),
+            .fx => addr(s.fx),
+            .fy => addr(s.fy),
+            .fixed => addr(s.fixed),
+            .perm => addr(s.tree.perm),
             .rng_buf => 0,
         };
     }
 
+    pub fn getForce(s: *Sim, fh: u32) ?*Force {
+        if (fh == 0 or fh > s.forces.len) return null;
+        return s.forces[fh - 1];
+    }
+
+    pub fn addForce(s: *Sim, a: Allocator, f: *Force) !u32 {
+        for (s.forces, 0..) |slot, i| if (slot == null) {
+            s.forces[i] = f;
+            return @intCast(i + 1);
+        };
+        s.forces = try a.realloc(s.forces, s.forces.len + 1);
+        s.forces[s.forces.len - 1] = f;
+        return @intCast(s.forces.len);
+    }
+
     /// Builds the shared tree on (x, y), or on (x + vx, y + vy) when `shifted`.
     pub fn buildTree(s: *Sim, a: Allocator, shifted: bool) !void {
+        @setFloatMode(.strict);
         const n = s.n;
         if (shifted) {
             for (0..n) |i| {

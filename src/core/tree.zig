@@ -75,6 +75,9 @@ pub const Tree = struct {
     /// diff[k] = number of positions in perm[1..k] that differ from their predecessor.
     diff: []u32 = &.{},
     stack: []Frame = &.{},
+    /// Traversal stack for the force kernels' inlined `visit`; every cell is
+    /// pushed at most once per traversal, so `len` entries always suffice.
+    vstack: []u32 = &.{},
     cap: u32 = 0,
 
     pub fn deinit(t: *Tree, a: Allocator) void {
@@ -85,6 +88,7 @@ pub const Tree = struct {
         a.free(t.keys_tmp);
         a.free(t.diff);
         a.free(t.stack);
+        a.free(t.vstack);
         t.* = .{};
     }
 
@@ -208,6 +212,7 @@ pub const Tree = struct {
         }
 
         try t.emit(a, xs, ys);
+        if (t.vstack.len < t.len) t.vstack = try a.realloc(t.vstack, t.cells.len);
     }
 
     /// Stable 8-pass LSD radix sort of keys[0..m] carrying perm; passes whose

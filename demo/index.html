@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>d3-force vs d3-force-wasm</title>
+<script type="importmap">
+{
+  "imports": {
+    "d3-force": "../node_modules/d3-force/src/index.js",
+    "d3-quadtree": "../node_modules/d3-quadtree/src/index.js",
+    "d3-dispatch": "../node_modules/d3-dispatch/src/index.js",
+    "d3-timer": "../node_modules/d3-timer/src/index.js"
+  }
+}
+</script>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --quiet: #6b6b66; --line: #e2e1dc;
+    --js: #c2410c; --wasm: #1d4ed8; --ok: #15803d; --bad: #b91c1c;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1e1e1c; --ink: #ecebe6; --quiet: #9b9a94; --line: #34332f;
+      --js: #fb923c; --wasm: #7aa2ff; --ok: #4ade80; --bad: #f87171;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 2px; }
+  .sub { color: var(--quiet); margin: 0 0 14px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 12px; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  select, button { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  button:disabled { opacity: 0.5; }
+  .stage { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .stage { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-width: 0; }
+  .panel h2 { font-size: 14px; margin: 0 0 6px; display: flex; justify-content: space-between; gap: 8px; }
+  .panel h2 .tag { font-weight: 600; }
+  .js .tag { color: var(--js); } .wasm .tag { color: var(--wasm); }
+  canvas { width: 100%; aspect-ratio: 1; display: block; border-radius: 8px; background: var(--bg); }
+  .metric { font-variant-numeric: tabular-nums; color: var(--quiet); font-weight: 400; }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 12px 0; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  .summary b { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  h3 { font-size: 15px; margin: 22px 0 6px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--quiet); font-weight: 500; }
+  .note { color: var(--quiet); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>d3-force vs d3-force-wasm</h1>
+  <p class="sub">The same seeded graph runs through both libraries, one tick each per frame. Times exclude drawing.</p>
+
+  <div class="controls">
+    <label>Nodes
+      <select id="n">
+        <option>500</option><option selected>2000</option><option>5000</option><option>10000</option><option>20000</option><option>50000</option>
+      </select>
+    </label>
+    <label>Forces
+      <select id="forces">
+        <option value="default" selected>manyBody + link + center</option>
+        <option value="collide">+ collide</option>
+        <option value="charge">manyBody only</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="links" checked> Draw links</label>
+    <button id="restart" class="primary">Restart</button>
+    <button id="pause">Pause</button>
+  </div>
+
+  <div class="summary">
+    <span>Speed-up <b id="speedup">–</b></span>
+    <span>Tick <b id="tick">0</b></span>
+    <span>Output <b id="parity">–</b></span>
+  </div>
+
+  <div class="stage">
+    <section class="panel js">
+      <h2><span class="tag">d3-force 3.0.0 (JS)</span><span class="metric" id="js-ms">– ms/tick</span></h2>
+      <canvas id="js-canvas"></canvas>
+    </section>
+    <section class="panel wasm">
+      <h2><span class="tag">d3-force-wasm (Zig → wasm)</span><span class="metric" id="wasm-ms">– ms/tick</span></h2>
+      <canvas id="wasm-canvas"></canvas>
+    </section>
+  </div>
+
+  <h3>Benchmark: 300 ticks, no drawing</h3>
+  <p class="note">Runs each library on its own copy of the graph, alternating which goes first; the live view pauses while it runs.</p>
+  <div class="controls"><button id="bench" class="primary">Run benchmark</button><span id="bench-status" class="note"></span></div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Scenario</th><th>d3-force</th><th>d3-force-wasm</th><th>Speed-up</th><th>Identical</th></tr></thead>
+      <tbody id="bench-rows"><tr><td colspan="5" class="note">Not run yet.</td></tr></tbody>
+    </table>
+  </div>
+</main>
+<script type="module" src="demo.js"></script>
+</body>
+</html>

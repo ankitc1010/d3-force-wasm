@@ -108,3 +108,69 @@ test "visit order is preorder and visitAfter is post-order" {
         try std.testing.expect(pos[ch] < pos[i]);
     };
 }
+
+const Sim = @import("sim.zig").Sim;
+const Force = @import("force.zig").Force;
+
+fn addForce(s: *Sim, kind: @import("force.zig").Kind) !*Force {
+    const f = try a.create(Force);
+    f.* = .{ .kind = kind };
+    _ = try s.addForce(a, f);
+    return f;
+}
+
+test "node-sized force arrays follow the node count, padded with NaN" {
+    var s: Sim = .{};
+    defer s.deinit(a);
+    const f = try addForce(&s, .x);
+    try f.setCount(a, 2);
+    f.f0[0] = 1;
+    f.f1[1] = 2;
+    try std.testing.expect(try s.setNodeCount(a, 5));
+    try std.testing.expectEqual(@as(u32, 5), f.count);
+    try std.testing.expectEqual(@as(f64, 1), f.f0[0]);
+    try std.testing.expectEqual(@as(f64, 2), f.f1[1]);
+    for (f.f0[2..], f.f1[2..]) |x, t| try std.testing.expect(std.math.isNan(x) and std.math.isNan(t));
+    // Shrinking keeps the arrays; the kernels only read the first n.
+    _ = try s.setNodeCount(a, 3);
+    try std.testing.expectEqual(@as(u32, 5), f.count);
+}
+
+test "link arrays do not follow the node count, and bad indices are rejected" {
+    var s: Sim = .{};
+    defer s.deinit(a);
+    _ = try s.setNodeCount(a, 3);
+    const f = try addForce(&s, .link);
+    try f.setCount(a, 1);
+    _ = try s.setNodeCount(a, 10);
+    try std.testing.expectEqual(@as(u32, 1), f.count);
+    f.source[0] = 0;
+    f.target[0] = 10;
+    const never = struct {
+        fn random() f64 {
+            unreachable;
+        }
+    }.random;
+    try std.testing.expectError(error.BadArgument, @import("link.zig").run(&s, f, 1, &never));
+}
+
+test "integrate applies the fixed-position rule per axis" {
+    var s: Sim = .{};
+    defer s.deinit(a);
+    _ = try s.setNodeCount(a, 2);
+    for (0..2) |i| {
+        s.x[i] = 1;
+        s.y[i] = 2;
+        s.vx[i] = 10;
+        s.vy[i] = 20;
+        s.fx[i] = -5;
+        s.fy[i] = -6;
+    }
+    s.fixed[0] = 0;
+    s.fixed[1] = 2; // fy only
+    @import("simple.zig").integrate(&s, 0.5);
+    try std.testing.expectEqualSlices(f64, &.{ 6, 6 }, s.x[0..2]);
+    try std.testing.expectEqualSlices(f64, &.{ 5, 5 }, s.vx[0..2]);
+    try std.testing.expectEqualSlices(f64, &.{ 12, -6 }, s.y[0..2]);
+    try std.testing.expectEqualSlices(f64, &.{ 10, 0 }, s.vy[0..2]);
+}
