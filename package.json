@@ -1,6 +1,6 @@
 {
   "name": "d3-force-wasm",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop-in, bit-exact replacement for d3-force v3 with a Zig/WebAssembly core.",
   "keywords": [
     "d3",
@@ -16,7 +16,7 @@
     "zig",
     "verlet"
   ],
-  "homepage": "https://github.com/ankitc1010/d3-force-wasm#readme",
+  "homepage": "https://ankitc1010.github.io/d3-force-wasm/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ankitc1010/d3-force-wasm.git"
