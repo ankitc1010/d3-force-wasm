@@ -66,7 +66,7 @@ test "near-duplicates below 2^-32 of the extent still separate" {
         deepest = @min(deepest, c.x1 - c.x0);
     };
     try std.testing.expectEqual(@as(u32, 4), leaves);
-    try std.testing.expect(deepest < 2048.0 / (1 << 32));
+    try std.testing.expect(deepest < 2048.0 / @as(f64, 1 << 32));
 }
 
 test "radix sort output is sorted and stable" {

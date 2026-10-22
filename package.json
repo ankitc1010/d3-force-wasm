@@ -12,7 +12,7 @@
   "scripts": {
     "build:wasm": "zig build",
     "test:zig": "zig build test",
-    "test": "node --test test/",
+    "test": "node --test test/*-test.js",
     "traces": "node scripts/tree-traces.js"
   },
   "license": "ISC",
