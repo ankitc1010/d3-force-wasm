@@ -31,7 +31,7 @@ Milliseconds per tick with forceManyBody + forceLink + forceCenter on a random g
 | 10,000 + forceCollide | 101 ms | 20 ms | **5.1×** |
 | 50,000 | 522 ms | 98 ms | **5.3×** |
 
-To see it in your own browser, run the [demo](#demo).
+To see it in your own browser, open the **[live demo](https://ankitc1010.github.io/d3-force-wasm/)**.
 
 ## Bit-exact by design
 
@@ -98,7 +98,9 @@ Exports: `forceSimulation`, `forceCenter`, `forceCollide`, `forceLink`, `forceMa
 
 ## Demo
 
-The repo includes a side-by-side demo. It runs the same graph through both libraries and shows the live time per tick, the speed-up, and whether the output is still bit-identical:
+**[ankitc1010.github.io/d3-force-wasm](https://ankitc1010.github.io/d3-force-wasm/)** runs the same graph through both libraries side by side and shows the live time per tick, the speed-up, and whether the output is still bit-identical. It loads the published package from npm.
+
+To run it against your local build:
 
 ```sh
 git clone https://github.com/ankitc1010/d3-force-wasm.git
@@ -117,7 +119,7 @@ You need [Zig 0.16.0](https://ziglang.org/download/) and Node 18+.
 | `npm test` | Tree tests, facade tests, and d3-force's own test suite |
 | `npm run test:parity` | Bitwise parity against d3-force (`PARITY_SEEDS=50` for the full gate) |
 | `npm run test:zig` | Zig unit tests in ReleaseSafe |
-| `npm run demo` | Serves the demo on http://localhost:8080 |
+| `npm run demo` | Serves the demo against the local build on http://localhost:8080 |
 
 The layout:
 
@@ -126,7 +128,7 @@ src/core/      Zig core: tree build, force kernels, exported ABI
 src/*.js       JS facade: d3-force's API, sync layer, dispatch and timer
 test/parity/   bitwise parity corpus against d3-force
 test/d3/       d3-force's own tests, unchanged except the import path
-demo/          side-by-side demo page
+docs/          side-by-side demo page (GitHub Pages)
 ```
 
 ## Roadmap

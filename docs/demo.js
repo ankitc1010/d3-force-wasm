@@ -3,7 +3,7 @@
 // arrays are compared with Object.is and any divergence is reported.
 
 import * as d3 from "d3-force";
-import * as wasm from "../src/index.js";
+import * as wasm from "d3-force-wasm";
 
 const $ = (id) => document.getElementById(id);
 
@@ -206,5 +206,6 @@ function timeTick10(sim) {
 }
 
 $("bench").onclick = bench;
+$("source").textContent = window.D3FW_SOURCE || "d3-force-wasm";
 
 start();

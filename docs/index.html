@@ -4,15 +4,33 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>d3-force vs d3-force-wasm</title>
-<script type="importmap">
-{
-  "imports": {
-    "d3-force": "../node_modules/d3-force/src/index.js",
-    "d3-quadtree": "../node_modules/d3-quadtree/src/index.js",
-    "d3-dispatch": "../node_modules/d3-dispatch/src/index.js",
-    "d3-timer": "../node_modules/d3-timer/src/index.js"
-  }
-}
+<meta name="description" content="d3-force and d3-force-wasm side by side: same graph, bit-identical output, live speed comparison.">
+<script>
+  // On localhost (npm run demo) the page uses this checkout's build; on
+  // GitHub Pages it uses the published packages from jsDelivr. Import maps
+  // must exist before the first module script, so this one is added here.
+  (function() {
+    var local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+    var cdn = "https://cdn.jsdelivr.net/npm/";
+    var imports = local ? {
+      "d3-force-wasm": "/src/index.js",
+      "d3-force": "/node_modules/d3-force/src/index.js",
+      "d3-quadtree": "/node_modules/d3-quadtree/src/index.js",
+      "d3-dispatch": "/node_modules/d3-dispatch/src/index.js",
+      "d3-timer": "/node_modules/d3-timer/src/index.js"
+    } : {
+      "d3-force-wasm": cdn + "d3-force-wasm@0.1.0/src/index.js",
+      "d3-force": cdn + "d3-force@3.0.0/src/index.js",
+      "d3-quadtree": cdn + "d3-quadtree@3.0.1/src/index.js",
+      "d3-dispatch": cdn + "d3-dispatch@3.0.1/src/index.js",
+      "d3-timer": cdn + "d3-timer@3.0.1/src/index.js"
+    };
+    var s = document.createElement("script");
+    s.type = "importmap";
+    s.textContent = JSON.stringify({imports: imports});
+    document.currentScript.after(s);
+    window.D3FW_SOURCE = local ? "local build" : "d3-force-wasm@0.1.0 from npm";
+  })();
 </script>
 <style>
   :root {
@@ -30,8 +48,15 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
   main { max-width: 1200px; margin: 0 auto; padding: 16px; }
-  h1 { font-size: 20px; margin: 4px 0 2px; }
+  h1 { font-size: clamp(22px, 5vw, 30px); margin: 8px 0 6px; letter-spacing: -0.01em; }
+  .lead { font-size: 16px; margin: 0 0 10px; max-width: 60ch; }
   .sub { color: var(--quiet); margin: 0 0 14px; }
+  .links { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 0 0 18px; }
+  .links a { color: var(--ink); font-weight: 600; text-decoration: none; border-bottom: 1px solid var(--line); }
+  .links a:hover { border-bottom-color: var(--ink); }
+  code.install { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; }
+  footer { color: var(--quiet); font-size: 13px; margin: 28px 0 8px; }
+  footer a { color: inherit; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 12px; }
   label { display: inline-flex; gap: 6px; align-items: center; }
   select, button { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
@@ -62,7 +87,13 @@
 <body>
 <main>
   <h1>d3-force vs d3-force-wasm</h1>
-  <p class="sub">The same seeded graph runs through both libraries, one tick each per frame. Times exclude drawing. Untick a side to stop running and drawing it.</p>
+  <p class="lead">A drop-in replacement for d3-force with a WebAssembly core: change one import, get the same output to the last bit, faster.</p>
+  <div class="links">
+    <code class="install">npm i d3-force-wasm</code>
+    <a href="https://github.com/ankitc1010/d3-force-wasm">GitHub</a>
+    <a href="https://www.npmjs.com/package/d3-force-wasm">npm</a>
+  </div>
+  <p class="sub">Below, the same seeded graph runs through both libraries in your browser, one tick each per frame. Times exclude drawing. "Bit-identical" compares every node's position and velocity after every tick. Untick a side to stop running and drawing it.</p>
 
   <div class="controls">
     <label>Nodes
@@ -108,6 +139,7 @@
       <tbody id="bench-rows"><tr><td colspan="5" class="note">Not run yet.</td></tr></tbody>
     </table>
   </div>
+  <footer>Running <span id="source">–</span> against d3-force 3.0.0. Results depend on your device and browser; the benchmark table is the fairer comparison. ISC licensed; d3-force by Mike Bostock.</footer>
 </main>
 <script type="module" src="demo.js"></script>
 </body>

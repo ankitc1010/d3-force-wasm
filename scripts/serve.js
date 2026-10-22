@@ -1,6 +1,6 @@
 // Minimal static server for the demo, with no dependencies.
 //
-//   npm run demo        builds the core, then serves http://localhost:8080/demo/
+//   npm run demo        builds the core, then serves http://localhost:8080/docs/
 
 import {createServer} from "node:http";
 import {readFile} from "node:fs/promises";
@@ -13,7 +13,7 @@ const types = {".html": "text/html", ".js": "text/javascript", ".json": "applica
 
 createServer(async (req, res) => {
   let path = decodeURIComponent(new URL(req.url, "http://x").pathname);
-  if (path === "/" || path === "/demo") return void res.writeHead(302, {location: "/demo/"}).end();
+  if (path === "/" || path === "/demo" || path === "/demo/" || path === "/docs") return void res.writeHead(302, {location: "/docs/"}).end();
   if (path.endsWith("/")) path += "index.html";
   const file = normalize(join(root, path));
   if (!file.startsWith(root.endsWith(sep) ? root : root + sep)) return void res.writeHead(403).end();
@@ -23,4 +23,4 @@ createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end("not found");
   }
-}).listen(port, "127.0.0.1", () => console.log(`demo: http://localhost:${port}/demo/`));
+}).listen(port, "127.0.0.1", () => console.log(`demo: http://localhost:${port}/`));
