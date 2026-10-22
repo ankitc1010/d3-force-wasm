@@ -13,6 +13,7 @@ const types = {".html": "text/html", ".js": "text/javascript", ".json": "applica
 
 createServer(async (req, res) => {
   let path = decodeURIComponent(new URL(req.url, "http://x").pathname);
+  if (path === "/" || path === "/demo") return void res.writeHead(302, {location: "/demo/"}).end();
   if (path.endsWith("/")) path += "index.html";
   const file = normalize(join(root, path));
   if (!file.startsWith(root.endsWith(sep) ? root : root + sep)) return void res.writeHead(403).end();

@@ -109,29 +109,48 @@ function start() {
   frame = requestAnimationFrame(loop);
 }
 
+// A side switched off is neither ticked nor drawn, so the other side gets
+// the whole frame; the comparison numbers need both sides running.
 function loop() {
-  const s = live;
-  if (s.a.sim.alpha() >= s.a.sim.alphaMin()) {
+  const s = live, jsOn = $("js-on").checked, wasmOn = $("wasm-on").checked;
+  const lead = jsOn ? s.a.sim : wasmOn ? s.b.sim : null;
+  const running = lead && lead.alpha() >= lead.alphaMin();
+  if (running) {
     // Alternate which library goes first so neither always gets a warm cache.
-    if (s.tick & 1) s.mb.add(timeTick(s.b.sim)), s.ma.add(timeTick(s.a.sim));
-    else s.ma.add(timeTick(s.a.sim)), s.mb.add(timeTick(s.b.sim));
+    if (s.tick & 1) {
+      if (wasmOn) s.mb.add(timeTick(s.b.sim));
+      if (jsOn) s.ma.add(timeTick(s.a.sim));
+    } else {
+      if (jsOn) s.ma.add(timeTick(s.a.sim));
+      if (wasmOn) s.mb.add(timeTick(s.b.sim));
+    }
     ++s.tick;
-    if (!s.diverged && !identical(s.a.nodes, s.b.nodes)) s.diverged = s.tick;
+    if (jsOn && wasmOn && !s.diverged && !identical(s.a.nodes, s.b.nodes)) s.diverged = s.tick;
   }
   const c = colors(), drawLinks = $("links").checked;
-  draw($("js-canvas"), s.a, c.js, drawLinks);
-  draw($("wasm-canvas"), s.b, c.wasm, drawLinks);
+  if (jsOn) draw($("js-canvas"), s.a, c.js, drawLinks);
+  if (wasmOn) draw($("wasm-canvas"), s.b, c.wasm, drawLinks);
 
-  $("js-ms").textContent = `${s.ma.mean.toFixed(2)} ms/tick`;
-  $("wasm-ms").textContent = `${s.mb.mean.toFixed(2)} ms/tick`;
-  $("speedup").textContent = s.mb.mean > 0 ? `${(s.ma.mean / s.mb.mean).toFixed(2)}×` : "–";
-  $("tick").textContent = s.tick;
+  $("js-ms").textContent = jsOn ? `${s.ma.mean.toFixed(2)} ms/tick` : "off";
+  $("wasm-ms").textContent = wasmOn ? `${s.mb.mean.toFixed(2)} ms/tick` : "off";
+  const both = jsOn && wasmOn;
+  $("speedup").textContent = both && s.mb.mean > 0 ? `${(s.ma.mean / s.mb.mean).toFixed(2)}×` : "–";
+  $("tick").textContent = lead && !running ? `${s.tick} (settled)` : s.tick;
   const parity = $("parity");
-  parity.textContent = s.diverged ? `diverged at tick ${s.diverged}` : "bit-identical";
-  parity.className = s.diverged ? "bad" : "ok";
+  parity.textContent = s.diverged ? `diverged at tick ${s.diverged}` : both ? "bit-identical" : "– (one side off)";
+  parity.className = s.diverged ? "bad" : both ? "ok" : "";
 
-  if (s.a.sim.alpha() < s.a.sim.alphaMin()) $("tick").textContent = `${s.tick} (settled)`;
-  else if (!paused) frame = requestAnimationFrame(loop);
+  if (running && !paused) frame = requestAnimationFrame(loop);
+}
+
+// Turning a side off just stops it; turning it back on restarts both, since
+// the side that was off has fallen behind and the comparison needs them in step.
+for (const [id, panel] of [["js-on", "js"], ["wasm-on", "wasm"]]) {
+  $(id).onchange = () => {
+    document.querySelector(`.panel.${panel}`).classList.toggle("off", !$(id).checked);
+    if ($(id).checked) start();
+    else if (!paused) cancelAnimationFrame(frame), frame = requestAnimationFrame(loop);
+  };
 }
 
 $("restart").onclick = start;

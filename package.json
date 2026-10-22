@@ -1,10 +1,46 @@
 {
   "name": "d3-force-wasm",
-  "version": "0.0.0",
-  "description": "Drop-in replacement for d3-force v3 with a Zig/WebAssembly core.",
+  "version": "0.1.0",
+  "description": "Drop-in, bit-exact replacement for d3-force v3 with a Zig/WebAssembly core.",
+  "keywords": [
+    "d3",
+    "d3-module",
+    "d3-force",
+    "force",
+    "layout",
+    "graph",
+    "network",
+    "simulation",
+    "wasm",
+    "webassembly",
+    "zig",
+    "verlet"
+  ],
+  "homepage": "https://github.com/ankitc1010/d3-force-wasm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ankitc1010/d3-force-wasm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ankitc1010/d3-force-wasm/issues"
+  },
+  "author": "Ankit Chauhan",
+  "license": "ISC",
   "type": "module",
   "main": "src/index.js",
   "module": "src/index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/*.js",
+    "index.d.ts"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=18"
@@ -16,9 +52,18 @@
     "test": "node --test test/*-test.js && node --import ./test/d3/setup.js --test test/d3/*-test.js",
     "test:parity": "node --test test/parity/*-test.js",
     "traces": "node scripts/tree-traces.js",
-    "demo": "npm run build:wasm && node scripts/serve.js"
+    "demo": "npm run build:wasm && node scripts/serve.js",
+    "prepack": "npm run build:wasm",
+    "prepublishOnly": "npm test"
   },
-  "license": "ISC",
+  "peerDependencies": {
+    "@types/d3-force": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@types/d3-force": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "d3-force": "3.0.0",
     "d3-quadtree": "3.0.1"

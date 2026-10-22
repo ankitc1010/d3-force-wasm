@@ -43,6 +43,8 @@
   .panel h2 { font-size: 14px; margin: 0 0 6px; display: flex; justify-content: space-between; gap: 8px; }
   .panel h2 .tag { font-weight: 600; }
   .js .tag { color: var(--js); } .wasm .tag { color: var(--wasm); }
+  .panel.off canvas { opacity: 0.15; }
+  .panel h2 input { accent-color: currentColor; width: 18px; height: 18px; margin: 0; }
   canvas { width: 100%; aspect-ratio: 1; display: block; border-radius: 8px; background: var(--bg); }
   .metric { font-variant-numeric: tabular-nums; color: var(--quiet); font-weight: 400; }
   .summary { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 12px 0; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
@@ -60,7 +62,7 @@
 <body>
 <main>
   <h1>d3-force vs d3-force-wasm</h1>
-  <p class="sub">The same seeded graph runs through both libraries, one tick each per frame. Times exclude drawing.</p>
+  <p class="sub">The same seeded graph runs through both libraries, one tick each per frame. Times exclude drawing. Untick a side to stop running and drawing it.</p>
 
   <div class="controls">
     <label>Nodes
@@ -88,11 +90,11 @@
 
   <div class="stage">
     <section class="panel js">
-      <h2><span class="tag">d3-force 3.0.0 (JS)</span><span class="metric" id="js-ms">– ms/tick</span></h2>
+      <h2><label class="tag"><input type="checkbox" id="js-on" checked> d3-force 3.0.0 (JS)</label><span class="metric" id="js-ms">– ms/tick</span></h2>
       <canvas id="js-canvas"></canvas>
     </section>
     <section class="panel wasm">
-      <h2><span class="tag">d3-force-wasm (Zig → wasm)</span><span class="metric" id="wasm-ms">– ms/tick</span></h2>
+      <h2><label class="tag"><input type="checkbox" id="wasm-on" checked> d3-force-wasm (Zig → wasm)</label><span class="metric" id="wasm-ms">– ms/tick</span></h2>
       <canvas id="wasm-canvas"></canvas>
     </section>
   </div>
