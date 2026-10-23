@@ -2,3 +2,4 @@ node_modules/
 zig-out/
 .zig-cache/
 src/core-bytes.js
+src/core/bench_config.zig

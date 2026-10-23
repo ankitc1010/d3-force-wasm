@@ -149,6 +149,69 @@ pub const Tree = struct {
     /// Builds the tree over `xs[i], ys[i]` for i < xs.len. Nodes whose x or y is
     /// NaN are skipped, exactly as `addAll` skips them.
     pub fn build(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !void {
+        if (!try t.prepare(a, xs, ys)) return;
+
+        // Run boundaries between distinct positions, in sorted order.
+        const m = t.m;
+        t.diff[0] = 0;
+        for (1..m) |k| {
+            const p = t.perm[k];
+            const q = t.perm[k - 1];
+            t.diff[k] = t.diff[k - 1] + @intFromBool(xs[p] != xs[q] or ys[p] != ys[q]);
+        }
+
+        try t.emit(a, xs, ys);
+        if (t.vstack.len < t.len) t.vstack = try a.realloc(t.vstack, t.cells.len);
+    }
+
+    /// Fast-mode variant of `prepare` (TRD 2, fast tree): a square extent over
+    /// the bounding box, 16 quantised bits per axis interleaved into a 32-bit
+    /// Morton key, so the radix sort skips its four constant top bytes. The
+    /// midpoint semantics of d3-quadtree are not needed for the FMM tree.
+    pub fn prepareFast(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !bool {
+        const n: u32 = @intCast(xs.len);
+        try t.reserve(a, n);
+        const nan = std.math.nan(f64);
+        t.extent = .{ nan, nan, nan, nan };
+        t.len = 0;
+        t.root = NONE;
+        var bx0 = std.math.inf(f64);
+        var by0 = std.math.inf(f64);
+        var bx1 = -std.math.inf(f64);
+        var by1 = -std.math.inf(f64);
+        var m: u32 = 0;
+        for (0..n) |i| {
+            const x = xs[i];
+            const y = ys[i];
+            if (x != x or y != y) continue;
+            if (x < bx0) bx0 = x;
+            if (x > bx1) bx1 = x;
+            if (y < by0) by0 = y;
+            if (y > by1) by1 = y;
+            t.perm[m] = @intCast(i);
+            m += 1;
+        }
+        t.m = m;
+        if (bx0 > bx1 or by0 > by1) return false;
+        var side = @max(bx1 - bx0, by1 - by0);
+        if (!(side > 0)) side = 1;
+        t.extent = .{ bx0, by0, bx0 + side, by0 + side };
+        const scale = 65536.0 / side;
+        for (t.perm[0..m], t.keys[0..m]) |i, *key| {
+            const qx: u32 = @intFromFloat(@min(65535, @floor((xs[i] - bx0) * scale)));
+            const qy: u32 = @intFromFloat(@min(65535, @floor((ys[i] - by0) * scale)));
+            key.* = spread16(qx) | spread16(qy) << 1;
+        }
+        t.radixSort(m);
+        return true;
+    }
+
+    /// The shared first half of a build (TRD 2: the fast tree comes from the
+    /// same Morton keys and radix sort): extent by `addAll`'s cover, keys by
+    /// d3's midpoint test, stable radix sort of `keys` carrying `perm`. Leaves
+    /// `perm[0..m]` in Morton order with `keys[0..m]` sorted alongside and the
+    /// cell arrays untouched. Returns false when no point has finite coordinates.
+    pub fn prepare(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !bool {
         const n: u32 = @intCast(xs.len);
         try t.reserve(a, n);
         const nan = std.math.nan(f64);
@@ -175,7 +238,7 @@ pub const Tree = struct {
             m += 1;
         }
         t.m = m;
-        if (bx0 > bx1 or by0 > by1) return;
+        if (bx0 > bx1 or by0 > by1) return false;
         t.cover(bx0, by0);
         t.cover(bx1, by1);
 
@@ -202,17 +265,7 @@ pub const Tree = struct {
         }
 
         t.radixSort(m);
-
-        // Run boundaries between distinct positions, in sorted order.
-        t.diff[0] = 0;
-        for (1..m) |k| {
-            const p = t.perm[k];
-            const q = t.perm[k - 1];
-            t.diff[k] = t.diff[k - 1] + @intFromBool(xs[p] != xs[q] or ys[p] != ys[q]);
-        }
-
-        try t.emit(a, xs, ys);
-        if (t.vstack.len < t.len) t.vstack = try a.realloc(t.vstack, t.cells.len);
+        return true;
     }
 
     /// Stable 8-pass LSD radix sort of keys[0..m] carrying perm; passes whose
@@ -371,6 +424,16 @@ pub const Tree = struct {
         if (after) std.mem.reverse(u32, out[0..w]);
     }
 };
+
+/// Spreads the low 16 bits of `v` to the even bit positions of a u32.
+inline fn spread16(v: u32) u64 {
+    var x: u64 = v & 0xFFFF;
+    x = (x | (x << 8)) & 0x00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F;
+    x = (x | (x << 2)) & 0x33333333;
+    x = (x | (x << 1)) & 0x55555555;
+    return x;
+}
 
 inline fn quadrant(x: f64, y: f64, xm: f64, ym: f64) u2 {
     return @as(u2, @intFromBool(y >= ym)) << 1 | @intFromBool(x >= xm);

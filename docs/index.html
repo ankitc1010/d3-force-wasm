@@ -19,7 +19,7 @@
       "d3-dispatch": "/node_modules/d3-dispatch/src/index.js",
       "d3-timer": "/node_modules/d3-timer/src/index.js"
     } : {
-      "d3-force-wasm": cdn + "d3-force-wasm@0.1.0/src/index.js",
+      "d3-force-wasm": cdn + "d3-force-wasm@0.2.0/src/index.js",
       "d3-force": cdn + "d3-force@3.0.0/src/index.js",
       "d3-quadtree": cdn + "d3-quadtree@3.0.1/src/index.js",
       "d3-dispatch": cdn + "d3-dispatch@3.0.1/src/index.js",
@@ -29,7 +29,7 @@
     s.type = "importmap";
     s.textContent = JSON.stringify({imports: imports});
     document.currentScript.after(s);
-    window.D3FW_SOURCE = local ? "local build" : "d3-force-wasm@0.1.0 from npm";
+    window.D3FW_SOURCE = local ? "local build" : "d3-force-wasm@0.2.0 from npm";
   })();
 </script>
 <style>
@@ -87,18 +87,18 @@
 <body>
 <main>
   <h1>d3-force vs d3-force-wasm</h1>
-  <p class="lead">A drop-in replacement for d3-force with a WebAssembly core: change one import, get the same output to the last bit, faster.</p>
+  <p class="lead">A drop-in replacement for d3-force with a WebAssembly core: change one import, get the same output to the last bit, faster. Or opt into fast mode for an O(n) layout.</p>
   <div class="links">
     <code class="install">npm i d3-force-wasm</code>
     <a href="https://github.com/ankitc1010/d3-force-wasm">GitHub</a>
     <a href="https://www.npmjs.com/package/d3-force-wasm">npm</a>
   </div>
-  <p class="sub">Below, the same seeded graph runs through both libraries in your browser, one tick each per frame. Times exclude drawing. "Bit-identical" compares every node's position and velocity after every tick. Untick a side to stop running and drawing it.</p>
+  <p class="sub">Below, the same seeded graph runs through both libraries in your browser, one tick each per frame. Times exclude drawing. In exact mode "bit-identical" compares every node's position and velocity after every tick; in fast mode the many-body force is a fast multipole sum instead of Barnes–Hut, so the readout is the deviation from d3 as a share of the layout's extent. Untick a side to stop running and drawing it.</p>
 
   <div class="controls">
     <label>Nodes
       <select id="n">
-        <option>500</option><option selected>2000</option><option>5000</option><option>10000</option><option>20000</option><option>50000</option>
+        <option>500</option><option selected>2000</option><option>5000</option><option>10000</option><option>20000</option><option>50000</option><option>100000</option>
       </select>
     </label>
     <label>Forces
@@ -106,6 +106,12 @@
         <option value="default" selected>manyBody + link + center</option>
         <option value="collide">+ collide</option>
         <option value="charge">manyBody only</option>
+      </select>
+    </label>
+    <label>Mode
+      <select id="mode">
+        <option value="exact" selected>exact (bit-exact d3)</option>
+        <option value="fast">fast (O(n) multipole)</option>
       </select>
     </label>
     <label><input type="checkbox" id="links" checked> Draw links</label>
@@ -125,18 +131,18 @@
       <canvas id="js-canvas"></canvas>
     </section>
     <section class="panel wasm">
-      <h2><label class="tag"><input type="checkbox" id="wasm-on" checked> d3-force-wasm (Zig → wasm)</label><span class="metric" id="wasm-ms">– ms/tick</span></h2>
+      <h2><label class="tag"><input type="checkbox" id="wasm-on" checked> d3-force-wasm (Zig → wasm, <span id="wasm-mode">exact</span>)</label><span class="metric" id="wasm-ms">– ms/tick</span></h2>
       <canvas id="wasm-canvas"></canvas>
     </section>
   </div>
 
-  <h3>Benchmark: 300 ticks, no drawing</h3>
-  <p class="note">Runs each library on its own copy of the graph, alternating which goes first; the live view pauses while it runs.</p>
+  <h3>Benchmark: no drawing</h3>
+  <p class="note">Runs d3-force, exact mode and fast mode on their own copies of the graph, alternating which goes first; the live view pauses while it runs. 300 ticks up to 10,000 nodes, 100 at 20,000, 30 at 50,000.</p>
   <div class="controls"><button id="bench" class="primary">Run benchmark</button><span id="bench-status" class="note"></span></div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Scenario</th><th>d3-force</th><th>d3-force-wasm</th><th>Speed-up</th><th>Identical</th></tr></thead>
-      <tbody id="bench-rows"><tr><td colspan="5" class="note">Not run yet.</td></tr></tbody>
+      <thead><tr><th>Scenario</th><th>d3-force</th><th>exact</th><th>Speed-up</th><th>fast</th><th>Speed-up</th><th>Exact identical</th><th>Fast deviation</th></tr></thead>
+      <tbody id="bench-rows"><tr><td colspan="8" class="note">Not run yet.</td></tr></tbody>
     </table>
   </div>
   <footer>Running <span id="source">–</span> against d3-force 3.0.0. Results depend on your device and browser; the benchmark table is the fairer comparison. ISC licensed; d3-force by Mike Bostock.</footer>

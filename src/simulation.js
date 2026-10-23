@@ -24,7 +24,9 @@ export default function(nodes) {
       forces = new Map(),
       stepper = timer(step),
       event = dispatch("tick", "end"),
-      random = lcg();
+      random = lcg(),
+      precision = "exact",
+      fastOptions = null; // {order, opening} while precision is "fast"
 
   if (nodes == null) nodes = [];
 
@@ -48,6 +50,7 @@ export default function(nodes) {
     if (!(0 < iterations)) return simulation;
 
     ctx = context(nodes);
+    ctx.precision = fastOptions;
     ctx.copyIn(nodes);
     ctx.live = true;
     try {
@@ -100,7 +103,7 @@ export default function(nodes) {
 
   initializeNodes();
 
-  return simulation = {
+  simulation = {
     tick: tick,
 
     restart: function() {
@@ -170,4 +173,23 @@ export default function(nodes) {
       return arguments.length > 1 ? (event.on(name, _), simulation) : event.on(name);
     }
   };
+
+  // Extensions are non-enumerable so the object's keys stay d3-force's.
+  // precision("fast", {order, opening}) selects the O(n) kernels (TRD 2).
+  Object.defineProperty(simulation, "precision", {
+    configurable: true, writable: true, enumerable: false,
+    value: function(mode, options) {
+      if (!arguments.length) return precision;
+      if (mode !== "exact" && mode !== "fast") throw new Error("precision must be \"exact\" or \"fast\"");
+      precision = mode;
+      fastOptions = mode === "fast" ? {
+        order: Math.min(24, Math.max(1, Math.round(+(options && options.order) || 8))),
+        opening: Math.max(1.01, +(options && options.opening) || 1.5)
+      } : null;
+      context(nodes).precision = fastOptions;
+      return simulation;
+    }
+  });
+
+  return simulation;
 }

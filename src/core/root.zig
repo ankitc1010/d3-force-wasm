@@ -185,11 +185,34 @@ export fn force_run(h: u32, fh: u32, alpha: f64) i32 {
         .x => @import("simple.zig").axis(s, f, alpha, 0),
         .y => @import("simple.zig").axis(s, f, alpha, 1),
         .radial => @import("simple.zig").radial(s, f, alpha),
-        .link => @import("link.zig").run(s, f, alpha, &jsRandom) catch return status(.bad_argument),
-        .many_body => @import("many_body.zig").run(s, gpa, f, alpha, &jsRandom) catch return status(.out_of_memory),
-        .collide => @import("collide.zig").run(s, gpa, f, &jsRandom) catch return status(.out_of_memory),
+        .link => {
+            if (fastMode(s, f)) {
+                @import("link_fast.zig").run(s, gpa, f, alpha) catch |e| return status(if (e == error.BadArgument) .bad_argument else .out_of_memory);
+            } else @import("link.zig").run(s, f, alpha, &jsRandom) catch return status(.bad_argument);
+        },
+        .many_body => {
+            // Fast mode: FMM at or above the crossover; the exact kernel otherwise,
+            // or when the FMM declines a degenerate extent (TRD 2).
+            const fmm = @import("fmm.zig");
+            var done = false;
+            if (fastMode(s, f)) {
+                done = fmm.run(s, gpa, f, alpha) catch return status(.out_of_memory);
+            }
+            if (!done) @import("many_body.zig").run(s, gpa, f, alpha, &jsRandom) catch return status(.out_of_memory);
+        },
+        .collide => {
+            if (fastMode(s, f)) {
+                @import("grid.zig").run(s, gpa, f, alpha) catch return status(.out_of_memory);
+            } else @import("collide.zig").run(s, gpa, f, &jsRandom) catch return status(.out_of_memory);
+        },
     }
     return status(.ok);
+}
+
+/// Fast mode applies at or above the crossover node count (TRD 2); below it
+/// every kernel is the exact one, so small simulations stay bit-exact.
+fn fastMode(s: *const Sim, f: *const Force) bool {
+    return f.scalar(.precision) == 1 and s.n >= @import("fmm.zig").MIN_N;
 }
 
 export fn sim_integrate(h: u32, velocity_decay: f64) i32 {

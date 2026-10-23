@@ -7,6 +7,11 @@ const Tree = tree_mod.Tree;
 const NONE = tree_mod.NONE;
 const a = std.testing.allocator;
 
+test {
+    _ = @import("fmm.zig");
+    _ = @import("hash.zig");
+}
+
 test "empty and all-NaN inputs give an empty tree" {
     var t: Tree = .{};
     defer t.deinit(a);
@@ -173,4 +178,106 @@ test "integrate applies the fixed-position rule per axis" {
     try std.testing.expectEqualSlices(f64, &.{ 5, 5 }, s.vx[0..2]);
     try std.testing.expectEqualSlices(f64, &.{ 12, -6 }, s.y[0..2]);
     try std.testing.expectEqualSlices(f64, &.{ 10, 0 }, s.vy[0..2]);
+}
+
+const Scalar = @import("force.zig").Scalar;
+
+fn setScalar(f: *Force, which: Scalar, v: f64) void {
+    f.scalars[@intFromEnum(which)] = v;
+}
+
+test "fast link equals exact link bitwise on a perfect matching" {
+    // With one edge per node, Jacobi and Gauss-Seidel see the same operands.
+    var s: Sim = .{};
+    defer s.deinit(a);
+    const n: u32 = 2400;
+    _ = try s.setNodeCount(a, n);
+    var lcg = @import("rng.zig").Lcg{};
+    for (0..n) |i| {
+        s.x[i] = 500 * (lcg.next() - 0.5);
+        s.y[i] = 500 * (lcg.next() - 0.5);
+        s.vx[i] = lcg.next() - 0.5;
+        s.vy[i] = lcg.next() - 0.5;
+    }
+    s.x[7] = s.x[6];
+    s.y[7] = s.y[6]; // a zero-length edge, so jiggle runs
+    var f: Force = .{ .kind = .link };
+    defer f.deinit(a);
+    try f.setCount(a, n / 2);
+    for (0..n / 2) |e| {
+        f.source[e] = @intCast(2 * e);
+        f.target[e] = @intCast(2 * e + 1);
+        f.f0[e] = 0.7;
+        f.f1[e] = 30;
+        f.f2[e] = 0.5;
+    }
+    setScalar(&f, .iterations, 1);
+    setScalar(&f, .seed, 0.25);
+    const vx0 = try a.dupe(f64, s.vx[0..n]);
+    defer a.free(vx0);
+    const vy0 = try a.dupe(f64, s.vy[0..n]);
+    defer a.free(vy0);
+    try @import("link_fast.zig").run(&s, a, &f, 0.3);
+    const fast_vx = try a.dupe(f64, s.vx[0..n]);
+    defer a.free(fast_vx);
+    const fast_vy = try a.dupe(f64, s.vy[0..n]);
+    defer a.free(fast_vy);
+    @memcpy(s.vx[0..n], vx0);
+    @memcpy(s.vy[0..n], vy0);
+    const Jig = struct {
+        fn random() f64 {
+            return 0.25; // any value: exact draws it only for the zero-length edge
+        }
+    };
+    try @import("link.zig").run(&s, &f, 0.3, &Jig.random);
+    for (0..n) |i| {
+        if (i == 6 or i == 7) continue; // the jiggled edge differs by construction
+        try std.testing.expectEqual(s.vx[i], fast_vx[i]);
+        try std.testing.expectEqual(s.vy[i], fast_vy[i]);
+    }
+}
+
+test "fast collide matches exact collide on isolated pairs and reduces overlap in general" {
+    var s: Sim = .{};
+    defer s.deinit(a);
+    const n: u32 = 2000;
+    _ = try s.setNodeCount(a, n);
+    // Pairs 10 units apart on a 100-unit grid, radius 6: each pair overlaps and
+    // nothing else is within reach.
+    for (0..n) |i| {
+        const pair: f64 = @floatFromInt(i / 2);
+        const col = @mod(pair, 40.0);
+        const row = @floor(pair / 40.0);
+        s.x[i] = col * 100 + (if (i % 2 == 1) @as(f64, 10) else 0);
+        s.y[i] = row * 100 + (if (i % 2 == 1) @as(f64, 3) else 0);
+        s.vx[i] = 0;
+        s.vy[i] = 0;
+    }
+    var f: Force = .{ .kind = .collide };
+    defer f.deinit(a);
+    try f.setCount(a, n);
+    for (f.f0) |*r| r.* = 6;
+    setScalar(&f, .strength, 1);
+    setScalar(&f, .iterations, 1);
+    setScalar(&f, .seed, 0.25);
+    try @import("grid.zig").run(&s, a, &f, 0);
+    const fast_vx = try a.dupe(f64, s.vx[0..n]);
+    defer a.free(fast_vx);
+    const fast_vy = try a.dupe(f64, s.vy[0..n]);
+    defer a.free(fast_vy);
+    @memset(s.vx[0..n], 0);
+    @memset(s.vy[0..n], 0);
+    const Jig = struct {
+        fn random() f64 {
+            return 0.25;
+        }
+    };
+    try @import("collide.zig").run(&s, a, &f, &Jig.random);
+    var moved: u32 = 0;
+    for (0..n) |i| {
+        try std.testing.expectApproxEqRel(s.vx[i], fast_vx[i], 1e-12);
+        try std.testing.expectApproxEqRel(s.vy[i], fast_vy[i], 1e-12);
+        if (s.vx[i] != 0) moved += 1;
+    }
+    try std.testing.expectEqual(n, moved);
 }

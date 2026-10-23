@@ -88,6 +88,35 @@ const simulation = forceSimulation(nodes)
 
 Exports: `forceSimulation`, `forceCenter`, `forceCollide`, `forceLink`, `forceManyBody`, `forceRadial`, `forceX`, `forceY`.
 
+## Fast mode
+
+Exact mode reproduces d3-force bit for bit, and that also fixes its algorithm: Barnes–Hut is O(n log n). For large graphs you can opt into **fast mode**, which keeps the same forces and parameters but computes them in O(n):
+
+```js
+const simulation = forceSimulation(nodes)
+    .precision("fast")   // or .precision("fast", {order: 12, opening: 2}) for more accuracy
+    .force("charge", forceManyBody())
+    .force("link", forceLink(links))
+    .force("center", forceCenter());
+```
+
+- **manyBody** becomes a fast multipole method. At the defaults (`order: 8`, `opening: 1.5`) its RMS error against the true n-body sum is about 1e-6, two orders of magnitude *closer* to the exact sum than d3's θ = 0.9 Barnes–Hut approximation. `distanceMin`, `distanceMax` and `theta` keep their meaning; pairs closer than `distanceMin` are always computed directly.
+- **collide** becomes a uniform grid and **link** a sweep over adjacency lists. Both apply every pair's push from both ends in one pass (Jacobi) instead of in sequence (Gauss–Seidel), which converges to the same layout; stiff graphs may want `iterations(2)`.
+- **What stays the same:** the API, the defaults, `fx`/`fy`, custom forces, and `randomSource` (fast mode draws it once per force per tick to seed its jiggle).
+- **What you give up:** bit-identical output. With manyBody + link + center + collide, positions stay within about 1–2% of the layout's extent of d3's over 300 ticks; link + center alone drifts to about 5%, and a dense collide-only packing settles into a different but equally valid arrangement. The many-body force itself is more accurate than d3's; the drift comes from the Jacobi link and collide sweeps and from chaos amplifying tiny differences.
+- Below 2,000 nodes fast mode runs the exact kernels, so small simulations stay bit-exact. `precision()` returns the current mode and `precision("exact")` switches back at the next tick.
+
+Milliseconds per tick with forceManyBody + forceLink + forceCenter, m = 2n, Node 22 on the same arm64 phone as the table above, single thread (d3-force at one million nodes is not shown; it takes about 15 s per tick):
+
+| Nodes | d3-force | exact | fast | fast vs d3 | fast vs exact |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 74 ms | 14 ms | 11 ms | **6.7×** | 1.3× |
+| 10,000 + forceCollide | 107 ms | 21 ms | 12 ms | **8.7×** | 1.7× |
+| 100,000 | 1,248 ms | 242 ms | 120 ms | **10.4×** | 2.0× |
+| 1,000,000 | — | 4.8 s | 1.6 s | — | 3.0× |
+
+The gap between the two modes grows with n, as O(n) against O(n log n) should; multithreading, the next milestone, applies to both.
+
 ## Compatibility
 
 - **Runtimes:** Node 18+, Deno, Bun, Web Workers, and current Chrome, Firefox and Safari (16.4+).
@@ -133,11 +162,11 @@ docs/          side-by-side demo page (GitHub Pages)
 
 ## Roadmap
 
-0.1 ships the exact mode on a single thread. Next:
+0.1 shipped the exact mode on a single thread; 0.2 adds the opt-in O(n) fast mode. Next:
 
-- **Fast mode**, opt-in via `simulation.precision("fast")`: an O(n) fast multipole method for manyBody, an O(n) hashed grid for collide, and O(log n) `find`, within tested error bounds of exact mode.
-- **Threads**: multi-core execution on cross-origin-isolated pages, still bit-exact in exact mode.
-- **Loader**: a JS fallback for the first ticks in Chrome, a UMD build, and a strict size budget.
+- **Threads**: multi-core execution on cross-origin-isolated pages (and Node), still bit-exact in exact mode and thread-count independent in fast mode.
+- **Loader**: feature detection, a UMD build, and a size gate in CI.
+- **1.0** once the benchmark targets are met on two machines.
 
 ## License
 

@@ -4,6 +4,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tree = @import("tree.zig").Tree;
+const Fmm = @import("fmm.zig").Fmm;
+const Grid = @import("grid.zig").Grid;
 const Force = @import("force.zig").Force;
 const addr = @import("force.zig").addr;
 
@@ -25,12 +27,18 @@ pub const Sim = struct {
     px: []f64 = &.{},
     py: []f64 = &.{},
     tree: Tree = .{},
+    /// Fast many-body tree and expansions (fmm.zig).
+    fmm: Fmm = .{},
+    /// Fast collide grid (grid.zig).
+    grid: Grid = .{},
     /// Force handle fh refers to forces[fh - 1]; 0 is never a valid handle.
     forces: []?*Force = &.{},
 
     pub fn deinit(s: *Sim, a: Allocator) void {
         inline for (.{ "x", "y", "vx", "vy", "fx", "fy", "fixed", "px", "py" }) |f| a.free(@field(s, f));
         s.tree.deinit(a);
+        s.fmm.deinit(a);
+        s.grid.deinit(a);
         for (s.forces) |slot| if (slot) |f| {
             f.deinit(a);
             a.destroy(f);

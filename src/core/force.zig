@@ -7,8 +7,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Kind = enum(u32) { center, collide, link, many_body, radial, x, y };
 
-/// Indices for `force_set_scalar`.
-pub const Scalar = enum(u32) { strength, x, y, theta2, distance_min2, distance_max2, iterations };
+/// Indices for `force_set_scalar`. `precision` is 0 (exact) or 1 (fast);
+/// `order` and `opening` are the fast many-body FMM parameters; `seed` is
+/// the one `random()` draw fast mode makes per force per tick (TRD 2).
+pub const Scalar = enum(u32) { strength, x, y, theta2, distance_min2, distance_max2, iterations, precision, order, opening, seed };
 
 /// Indices for `force_ptr`. Meaning per kind:
 ///   many_body  f0 strength
@@ -25,7 +27,7 @@ pub fn addr(slice: anytype) usize {
 
 pub const Force = struct {
     kind: Kind,
-    scalars: [7]f64 = .{0} ** 7,
+    scalars: [11]f64 = .{0} ** 11,
     /// Length of every array: node count, or link count for `link`.
     count: u32 = 0,
     f0: []f64 = &.{},
@@ -33,9 +35,12 @@ pub const Force = struct {
     f2: []f64 = &.{},
     source: []u32 = &.{},
     target: []u32 = &.{},
+    /// Fast link's adjacency (link_fast.zig); empty until first used.
+    csr_ptr: []u32 = &.{},
+    csr_adj: []u32 = &.{},
 
     pub fn deinit(f: *Force, a: Allocator) void {
-        inline for (.{ "f0", "f1", "f2", "source", "target" }) |name| a.free(@field(f, name));
+        inline for (.{ "f0", "f1", "f2", "source", "target", "csr_ptr", "csr_adj" }) |name| a.free(@field(f, name));
         f.* = .{ .kind = f.kind };
     }
 

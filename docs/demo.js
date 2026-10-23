@@ -1,6 +1,8 @@
 // Side-by-side demo: d3-force and d3-force-wasm tick the same seeded graph
 // once per frame. Exact mode is bit-exact, so after every tick the two node
-// arrays are compared with Object.is and any divergence is reported.
+// arrays are compared with Object.is and any divergence is reported. Fast
+// mode (O(n) fast multipole many-body) is approximate by design, so the
+// readout there is the RMS position deviation as a share of the extent.
 
 import * as d3 from "d3-force";
 import * as wasm from "d3-force-wasm";
@@ -26,13 +28,28 @@ function graph(n) {
   return {nodes: Array.from({length: n}, () => ({})), links};
 }
 
-function build(lib, n, preset) {
+function build(lib, n, preset, mode) {
   const {nodes, links} = graph(n);
   const sim = lib.forceSimulation(nodes).force("charge", lib.forceManyBody()).stop();
   if (preset !== "charge") sim.force("link", lib.forceLink(links)).force("center", lib.forceCenter());
   if (preset === "collide") sim.force("collide", lib.forceCollide(3));
+  if (mode === "fast" && sim.precision) sim.precision("fast");
   return {sim, nodes, links};
 }
+
+// RMS distance between the two layouts, relative to the reference's extent.
+function deviation(a, b) {
+  let d2 = 0, x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = 0; i < a.length; ++i) {
+    const p = a[i], q = b[i], dx = p.x - q.x, dy = p.y - q.y;
+    d2 += dx * dx + dy * dy;
+    if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+    if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+  }
+  return Math.sqrt(d2 / a.length) / Math.max(x1 - x0, y1 - y0, 1e-12);
+}
+
+const pct = (v) => v < 1e-4 ? `${(v * 100).toExponential(1)}%` : `${(v * 100).toFixed(2)}%`;
 
 function identical(a, b) {
   for (let i = 0; i < a.length; ++i) {
@@ -102,8 +119,9 @@ let live = null, frame = 0, paused = false;
 
 function start() {
   cancelAnimationFrame(frame);
-  const n = +$("n").value, preset = $("forces").value;
-  live = {a: build(d3, n, preset), b: build(wasm, n, preset), ma: new Meter(), mb: new Meter(), tick: 0, diverged: 0};
+  const n = +$("n").value, preset = $("forces").value, mode = $("mode").value;
+  $("wasm-mode").textContent = mode;
+  live = {a: build(d3, n, preset), b: build(wasm, n, preset, mode), mode, ma: new Meter(), mb: new Meter(), tick: 0, diverged: 0, dev: 0};
   paused = false;
   $("pause").textContent = "Pause";
   frame = requestAnimationFrame(loop);
@@ -125,7 +143,10 @@ function loop() {
       if (wasmOn) s.mb.add(timeTick(s.b.sim));
     }
     ++s.tick;
-    if (jsOn && wasmOn && !s.diverged && !identical(s.a.nodes, s.b.nodes)) s.diverged = s.tick;
+    if (jsOn && wasmOn) {
+      if (s.mode === "fast") s.dev = deviation(s.a.nodes, s.b.nodes);
+      else if (!s.diverged && !identical(s.a.nodes, s.b.nodes)) s.diverged = s.tick;
+    }
   }
   const c = colors(), drawLinks = $("links").checked;
   if (jsOn) draw($("js-canvas"), s.a, c.js, drawLinks);
@@ -137,8 +158,9 @@ function loop() {
   $("speedup").textContent = both && s.mb.mean > 0 ? `${(s.ma.mean / s.mb.mean).toFixed(2)}×` : "–";
   $("tick").textContent = lead && !running ? `${s.tick} (settled)` : s.tick;
   const parity = $("parity");
-  parity.textContent = s.diverged ? `diverged at tick ${s.diverged}` : both ? "bit-identical" : "– (one side off)";
-  parity.className = s.diverged ? "bad" : both ? "ok" : "";
+  if (!both) parity.textContent = "– (one side off)", parity.className = "";
+  else if (s.mode === "fast") parity.textContent = `fast: ${pct(s.dev)} of extent from d3`, parity.className = "";
+  else parity.textContent = s.diverged ? `diverged at tick ${s.diverged}` : "bit-identical", parity.className = s.diverged ? "bad" : "ok";
 
   if (running && !paused) frame = requestAnimationFrame(loop);
 }
@@ -156,6 +178,7 @@ for (const [id, panel] of [["js-on", "js"], ["wasm-on", "wasm"]]) {
 $("restart").onclick = start;
 $("n").onchange = start;
 $("forces").onchange = start;
+$("mode").onchange = start;
 $("pause").onclick = () => {
   paused = !paused;
   $("pause").textContent = paused ? "Resume" : "Pause";
@@ -174,23 +197,28 @@ async function bench() {
   const rows = $("bench-rows");
   rows.innerHTML = "";
   const scenarios = [
-    [1000, "default"], [5000, "default"], [10000, "default"], [20000, "default"], [10000, "collide"]
+    [1000, "default", 300], [5000, "default", 300], [10000, "default", 300], [20000, "default", 100], [50000, "default", 30], [10000, "collide", 300]
   ];
-  for (const [n, preset] of scenarios) {
-    const label = `${n.toLocaleString()} nodes, ${preset === "collide" ? "+ collide" : "manyBody + link + center"}`;
+  for (const [n, preset, ticks] of scenarios) {
+    const label = `${n.toLocaleString()} nodes, ${preset === "collide" ? "+ collide" : "manyBody + link + center"}, ${ticks} ticks`;
     $("bench-status").textContent = `Running ${label}…`;
     await nextFrame();
-    const a = build(d3, n, preset), b = build(wasm, n, preset);
-    let ta = 0, tb = 0;
-    for (let k = 0; k < 300; k += 10) {
-      if ((k / 10) & 1) tb += timeTick10(b.sim), ta += timeTick10(a.sim);
-      else ta += timeTick10(a.sim), tb += timeTick10(b.sim);
+    const a = build(d3, n, preset), b = build(wasm, n, preset, "exact"), c = build(wasm, n, preset, "fast");
+    let ta = 0, tb = 0, tc = 0;
+    for (let k = 0; k < ticks; k += 10) {
+      // Rotate the order so no library always runs on a warm cache.
+      const order = [[a, (v) => ta += v], [b, (v) => tb += v], [c, (v) => tc += v]];
+      for (let r = 0; r < 3; ++r) {
+        const [s, add] = order[(r + k / 10) % 3];
+        add(timeTick10(s.sim));
+      }
       await nextFrame();
     }
-    const same = identical(a.nodes, b.nodes);
+    const same = identical(a.nodes, b.nodes), dev = deviation(a.nodes, c.nodes);
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${label}</td><td>${ta.toFixed(0)} ms</td><td>${tb.toFixed(0)} ms</td>`
-      + `<td><b>${(ta / tb).toFixed(2)}×</b></td><td class="${same ? "ok" : "bad"}">${same ? "yes" : "no"}</td>`;
+    tr.innerHTML = `<td>${label}</td><td>${ta.toFixed(0)} ms</td><td>${tb.toFixed(0)} ms</td><td><b>${(ta / tb).toFixed(2)}×</b></td>`
+      + `<td>${tc.toFixed(0)} ms</td><td><b>${(ta / tc).toFixed(2)}×</b></td>`
+      + `<td class="${same ? "ok" : "bad"}">${same ? "yes" : "no"}</td><td>${pct(dev)}</td>`;
     rows.append(tr);
   }
   $("bench-status").textContent = "Done.";
