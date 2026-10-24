@@ -6,13 +6,32 @@
 
 import {generator} from "../parity/scenarios.js";
 
+// Inputs use only correctly rounded arithmetic (+, −, ×, ÷, sqrt): V8's
+// Math.cos, sin and log differ in the last bit between x86-64 and arm64, so
+// layouts built with them, d3's own phyllotaxis start included, would give
+// the golden digests a different input on each architecture.
+function disk(r, cx, cy, radius) {
+  let x, y;
+  do x = 2 * r() - 1, y = 2 * r() - 1; while (x * x + y * y > 1);
+  return {x: cx + radius * x, y: cy + radius * y};
+}
+
+// d3's phyllotaxis, radius 10 √(0.5 + i), with the golden-angle turn applied
+// by a fixed rotation instead of cos and sin of i times the angle.
+function spiral(n) {
+  const c = -0.7373688780783197, s = 0.6754902942615238; // cos, sin of π (3 − √5)
+  const nodes = [];
+  for (let i = 0, u = 1, v = 0; i < n; ++i, [u, v] = [u * c - v * s, u * s + v * c]) {
+    const radius = 10 * Math.sqrt(0.5 + i);
+    nodes.push({x: radius * u, y: radius * v});
+  }
+  return nodes;
+}
+
 const layouts = {
   "uniform 4000": (r) => Array.from({length: 4000}, () => ({x: 1000 * (r() - 0.5), y: 1000 * (r() - 0.5)})),
-  "three clusters 6000": (r) => Array.from({length: 6000}, (_, i) => {
-    const c = i % 3, cx = [0, 400, -300][c], cy = [0, 100, 350][c], a = r() * 2 * Math.PI, d = 40 * Math.sqrt(-2 * Math.log(1 - r()));
-    return {x: cx + d * Math.cos(a), y: cy + d * Math.sin(a)};
-  }),
-  "phyllotaxis 8000": () => Array.from({length: 8000}, () => ({})),
+  "three clusters 6000": (r) => Array.from({length: 6000}, (_, i) => disk(r, [0, 400, -300][i % 3], [0, 100, 350][i % 3], 120)),
+  "spiral 8000": () => spiral(8000),
   "grid 2500 with exact zero deltas": () => Array.from({length: 2500}, (_, i) => ({x: 12 * (i % 50), y: 12 * Math.floor(i / 50)})),
   "dense sub-unit cluster 3000": (r) => Array.from({length: 3000}, () => ({x: 20 * r(), y: 20 * r()})),
 };
