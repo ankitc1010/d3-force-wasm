@@ -50,7 +50,7 @@ The test suite enforces this. A parity harness runs d3-force and d3-force-wasm s
 npm install d3-force-wasm
 ```
 
-There are no runtime dependencies. The wasm binary is inlined in the package, so there is no `.wasm` file to serve and no bundler plugin to configure.
+There are no runtime dependencies. The single-threaded wasm core is inlined in the package, so a page that never uses threads has no `.wasm` file to serve and no bundler plugin to configure. The threaded core is a separate file, fetched only where [threads](#threads) run.
 
 **TypeScript:** the API is d3-force's, so the types are too. Install `@types/d3-force` alongside it:
 
@@ -86,7 +86,7 @@ const simulation = forceSimulation(nodes)
     .on("tick", render);
 ```
 
-Exports: `forceSimulation`, `forceCenter`, `forceCollide`, `forceLink`, `forceManyBody`, `forceRadial`, `forceX`, `forceY`.
+Exports: `forceSimulation`, `forceCenter`, `forceCollide`, `forceLink`, `forceManyBody`, `forceRadial`, `forceX`, `forceY`, plus `configure` for [threads](#threads).
 
 ## Fast mode
 
@@ -115,12 +115,38 @@ Milliseconds per tick with forceManyBody + forceLink + forceCenter, m = 2n, Node
 | 100,000 | 1,248 ms | 242 ms | 120 ms | **10.4×** | 2.0× |
 | 1,000,000 | — | 4.8 s | 1.6 s | — | 3.0× |
 
-The gap between the two modes grows with n, as O(n) against O(n log n) should; multithreading, the next milestone, applies to both.
+The gap between the two modes grows with n, as O(n) against O(n log n) should.
+
+## Threads
+
+On Node, and on pages that are cross-origin isolated, each tick also runs on every core: the main thread plus `hardwareConcurrency − 1` workers sharing one WebAssembly memory. **Exact mode stays bit-identical to d3-force at any thread count**, and fast mode gives the same bits at any thread count (the same bits as 0.2.0's single thread).
+
+```js
+simulation.threads();      // workers the last tick used: 0 means one thread
+simulation.threads(3);     // use at most 3 workers; threads(0) keeps one thread, threads(null) is auto
+```
+
+- **Automatic.** A simulation of 2,000 nodes or more starts the pool at its first tick and moves onto it once the workers are up; the first few ticks run on one thread meanwhile. Smaller simulations stay on one thread.
+- **Headers.** Browsers share memory between threads only on pages served with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`). Without them nothing changes: one thread, no warning, and the threaded core is never fetched. Node needs nothing.
+- **Files.** The threaded core (`core-mt.wasm`, about 24 KB gzipped) and `worker.js` sit next to the module and are loaded with `new URL(…, import.meta.url)`, which Vite and webpack 5 handle. Elsewhere, point at them with `configure({coreURL, workerURL})` before the first tick.
+- **Failure.** If a worker crashes or stalls, the step it was in runs again on one thread within the same tick, with the same result; the rest of the page's simulations continue on one thread.
+- **Node.** Workers never keep a process alive: once the simulation's timer stops, the process exits as it does with d3-force.
+
+Milliseconds per tick with forceManyBody + forceLink + forceCenter, m = 2n, Node 22 on the same phone (8 cores: 1 × Cortex-X925, 3 × X4, 4 × A720). This run was thermally throttled, about 30% slower than the tables above across the board, so compare the columns within it; a cooler run reached 20× at 10,000 nodes in exact mode:
+
+| Nodes | Mode | d3-force | 1 thread | 8 threads | 8 threads vs d3 |
+|---:|---|---:|---:|---:|---:|
+| 10,000 | exact | 97.7 ms | 17.7 ms | 6.0 ms | **16.3×** |
+| 10,000 | fast | 100.8 ms | 18.1 ms | 5.4 ms | **18.6×** |
+| 100,000 | exact | 1,715 ms | 218 ms | 53.7 ms | **31.9×** |
+| 100,000 | fast | 1,728 ms | 158 ms | 41.3 ms | **41.9×** |
+
+`npm run bench:threads -- <nodes> <exact|fast>` measures your own machine.
 
 ## Compatibility
 
-- **Runtimes:** Node 18+, Deno, Bun, Web Workers, and current Chrome, Firefox and Safari (16.4+).
-- **Top-level await in Chrome.** Chrome refuses to compile wasm modules over 4 KB synchronously on the main thread. There, the module waits once for asynchronous instantiation when it's imported. Everywhere else, including Node, it loads synchronously. Your bundler needs to support top-level await: Vite, Rollup, esbuild and webpack 5 all do with an ES2022 target.
+- **Runtimes:** Node 18+, Deno, Bun, Web Workers, and current Chrome, Firefox (113+) and Safari (16.4+). The embedded core is deflated and inflated at import with the built-in `DecompressionStream`.
+- **Top-level await.** The module inflates its embedded core when it's imported, and Chrome also refuses to compile wasm modules over 4 KB synchronously on the main thread, so the import waits once for both. Your bundler needs to support top-level await: Vite, Rollup, esbuild and webpack 5 all do with an ES2022 target.
 - **Custom forces** work as before. Each one costs an O(n) copy of node fields out of wasm before it runs and back in after, so consecutive custom forces cost one round trip.
 - **Forces used standalone**, via `force.initialize(nodes, random)` then `force(alpha)`, behave as in d3-force. They expect `node.index` to match the node's position in `nodes`, which the simulation always ensures.
 - **Links** must point at nodes in the simulation's `nodes` array, as they do whenever ids are resolved by `forceLink`.
@@ -144,9 +170,11 @@ You need [Zig 0.16.0](https://ziglang.org/download/) and Node 18+.
 
 | Command | What it does |
 |---|---|
-| `npm run build:wasm` | Builds `core.wasm` and inlines it into `src/core-bytes.js` |
+| `npm run build:wasm` | Builds `core.wasm` and `core-mt.wasm`, inlines the first into `src/core-bytes.js` and copies the second to `src/` |
 | `npm test` | Tree tests, facade tests, and d3-force's own test suite |
 | `npm run test:parity` | Bitwise parity against d3-force (`PARITY_SEEDS=50` for the full gate) |
+| `npm run test:threads` | Bitwise gates at 0, 1, 3 and 7 workers, fast mode against stored 0.2.0 output, and the failover paths |
+| `npm run bench:threads` | Milliseconds per tick for d3-force and for 0, 1, 3 and 7 workers |
 | `npm run test:zig` | Zig unit tests in ReleaseSafe |
 | `npm run demo` | Serves the demo against the local build on http://localhost:8080 |
 
@@ -155,16 +183,17 @@ The layout:
 ```
 src/core/      Zig core: tree build, force kernels, exported ABI
 src/*.js       JS facade: d3-force's API, sync layer, dispatch and timer
+src/pool.js    thread pool client, loaded only where threads run; src/worker.js is one worker
 test/parity/   bitwise parity corpus against d3-force
+test/threads/  thread gates, the fast golden corpus and the failover tests
 test/d3/       d3-force's own tests, unchanged except the import path
 docs/          side-by-side demo page (GitHub Pages)
 ```
 
 ## Roadmap
 
-0.1 shipped the exact mode on a single thread; 0.2 adds the opt-in O(n) fast mode. Next:
+0.1 shipped the exact mode on a single thread, 0.2 added the opt-in O(n) fast mode, and 0.3 adds threads. Next:
 
-- **Threads**: multi-core execution on cross-origin-isolated pages (and Node), still bit-exact in exact mode and thread-count independent in fast mode.
 - **Loader**: feature detection, a UMD build, and a size gate in CI.
 - **1.0** once the benchmark targets are met on two machines.
 

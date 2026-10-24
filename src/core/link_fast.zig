@@ -5,13 +5,17 @@
 //! source). Every edge is evaluated twice and no node writes another's
 //! velocity, so the result does not depend on processing order or threads.
 //! Jiggle on a zero-length edge is a hash of the edge index and the tick seed,
-//! so both ends agree on it.
+//! so both ends agree on it. On the thread pool (TRD 3) the snapshot runs in
+//! static chunks and the sweep in dynamic chunks of nodes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sim = @import("sim.zig").Sim;
 const Force = @import("force.zig").Force;
 const hash = @import("hash.zig");
+const pool = @import("pool.zig");
+
+const SWEEP_CHUNK: u32 = 256;
 
 const TARGET_BIT: u32 = 0x8000_0000;
 
@@ -22,19 +26,47 @@ pub fn run(s: *Sim, a: Allocator, f: *Force, alpha: f64) !void {
     for (f.source[0..m], f.target[0..m]) |src, tgt| {
         if (src >= n or tgt >= n) return error.BadArgument;
     }
-    try buildCsr(f, a, n);
-    const row = f.csr_ptr[0 .. n + 1];
-    const adj = f.csr_adj[0 .. 2 * m];
-    const seed = hash.seedFrom(f.scalar(.seed));
+    if (f.csr_n != n) {
+        try buildCsr(f, a, n);
+        f.csr_n = n;
+    }
+    const p = Sweep{
+        .s = s,
+        .f = f,
+        .alpha = alpha,
+        .row = f.csr_ptr[0 .. n + 1],
+        .adj = f.csr_adj[0 .. 2 * m],
+        .seed = hash.seedFrom(f.scalar(.seed)),
+        .size = pool.chunkSize(SWEEP_CHUNK),
+    };
     const iterations = f.scalar(.iterations);
     var k: f64 = 0;
     while (k < iterations) : (k += 1) {
         // Snapshot, so every edge sees the velocities from before this pass.
-        for (0..n) |i| {
-            s.px[i] = s.x[i] + s.vx[i];
-            s.py[i] = s.y[i] + s.vy[i];
-        }
-        for (0..n) |i| {
+        try s.shift();
+        try pool.parallelFor(&p, pool.chunks(n, p.size), Sweep.chunk);
+    }
+}
+
+const Sweep = struct {
+    s: *Sim,
+    f: *const Force,
+    alpha: f64,
+    row: []const u32,
+    adj: []const u32,
+    seed: u64,
+    size: u32,
+
+    fn chunk(p: *const Sweep, c: u32, _: u32) void {
+        @setFloatMode(.strict);
+        const s = p.s;
+        const f = p.f;
+        const row = p.row;
+        const adj = p.adj;
+        const seed = p.seed;
+        const alpha = p.alpha;
+        const r = pool.range(s.n, p.size, c);
+        for (r.lo..r.hi) |i| {
             var vx = s.vx[i];
             var vy = s.vy[i];
             const pxi = s.px[i];
@@ -65,7 +97,7 @@ pub fn run(s: *Sim, a: Allocator, f: *Force, alpha: f64) !void {
             s.vy[i] = vy;
         }
     }
-}
+};
 
 /// Adjacency in CSR form: row_ptr[n + 1], adj[2m] of edge index with the
 /// TARGET_BIT set on the entry stored under the edge's target. Rebuilt per

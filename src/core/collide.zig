@@ -1,6 +1,9 @@
 //! forceCollide, exact mode (TRD, Zig core design: "collide, exact mode").
 //! d3-force's collide.js over indices. Pushes write the other node's
-//! velocity and later nodes read it, so the pass is sequential.
+//! velocity and later nodes read it, so the pass is sequential; only the tree
+//! build and the radius sweep run on the thread pool, and from the second
+//! iteration on not even those, so no parallel phase follows a random draw
+//! (TRD 3, Facade: "Failure").
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,6 +11,8 @@ const Sim = @import("sim.zig").Sim;
 const Force = @import("force.zig").Force;
 const NONE = @import("tree.zig").NONE;
 const rng = @import("rng.zig");
+const pool = @import("pool.zig");
+const Tree = @import("tree.zig").Tree;
 
 pub fn run(s: *Sim, a: Allocator, f: *const Force, random: rng.Source) !void {
     @setFloatMode(.strict);
@@ -19,30 +24,26 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, random: rng.Source) !void {
     const vxs = s.vx;
     const vys = s.vy;
 
+    defer pool.setInline(false);
     var k: f64 = 0;
     while (k < iterations) : (k += 1) {
-        // Tree on (x + vx, y + vy), then prepare via visitAfter.
+        if (k > 0) pool.setInline(true);
+        // Tree on (x + vx, y + vy), then prepare via visitAfter: by subtree,
+        // then the top cells, as in many_body.zig.
         try s.buildTree(a, true);
         const t = &s.tree;
         if (t.root == NONE) continue;
         const perm = t.perm;
         const cells = t.cells[0..t.len];
-        var c = cells.len;
-        while (c > 0) {
-            c -= 1;
-            const quad = &cells[c];
-            if (quad.isLeaf()) {
-                // `quad.data` is the chain head; the rest of the chain is never read.
-                quad.r = radii[perm[quad.first + quad.count - 1]];
-            } else {
-                quad.r = 0;
-                for (quad.child) |ch| if (ch != NONE and cells[ch].r > quad.r) {
-                    quad.r = cells[ch].r;
-                };
-            }
+        const prep = Prep{ .t = t, .radii = radii };
+        try pool.parallelFor(&prep, t.n_jobs, Prep.job);
+        var top = t.n_tops;
+        while (top > 0) {
+            top -= 1;
+            prep.cell(t.tops[top]);
         }
 
-        const stack = t.vstack;
+        const stack = t.walkStack(0);
         for (0..s.n) |i| {
             const ri = radii[i];
             const ri2 = ri * ri;
@@ -99,3 +100,31 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, random: rng.Source) !void {
         }
     }
 }
+
+const Prep = struct {
+    t: *Tree,
+    radii: []const f64,
+
+    fn job(p: *const Prep, j: u32, _: u32) void {
+        const job_ = p.t.jobs[j];
+        var c = job_.base + job_.cells;
+        while (c > job_.base) {
+            c -= 1;
+            p.cell(c);
+        }
+    }
+
+    fn cell(p: *const Prep, c: u32) void {
+        const cells = p.t.cells;
+        const quad = &cells[c];
+        if (quad.isLeaf()) {
+            // `quad.data` is the chain head; the rest of the chain is never read.
+            quad.r = p.radii[p.t.perm[quad.first + quad.count - 1]];
+        } else {
+            quad.r = 0;
+            for (quad.child) |ch| if (ch != NONE and cells[ch].r > quad.r) {
+                quad.r = cells[ch].r;
+            };
+        }
+    }
+};

@@ -14,15 +14,29 @@
 //! test on their sub-range (stable partition), so the tree matches d3 at every
 //! depth. Cells are numbered in preorder with children in 0..3 order, which is
 //! exactly d3-quadtree's `visit` order.
+//!
+//! Every step runs on the thread pool (TRD 3, Kernels: "Exact mode"). Steps 1
+//! to 3 split by point. Step 4 splits by subtree: the main thread walks the
+//! top of the tree down to the cut (TRD 3, "The cut"), each job subtree counts
+//! its cells, and with those counts every cell is written at the index the
+//! serial preorder walk would give it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const pool = @import("pool.zig");
+const sort = @import("sort.zig");
 
 pub const NONE: u32 = 0xffff_ffff;
 pub const KEY_LEVELS = 32;
 /// d3 itself loops forever once two distinct points share a cell whose
 /// bounds are adjacent floats; the build stops splitting there instead.
 const MAX_DEPTH = 2200;
+/// Points per chunk of the key pass, whose 32 midpoint tests make it the
+/// costly one; the cheap box pass takes BOX_ROWS chunks per task and the run
+/// boundaries RUN_CHUNK points, so below 16k points they run inline.
+const CHUNK: u32 = 1024;
+const BOX_ROWS: u32 = 16;
+const RUN_CHUNK: u32 = 16384;
 
 /// One quadtree cell. `first`/`count` delimit its points in `perm`; a leaf's
 /// points are all coincident and its d3 chain order is `perm[first + count - 1]`
@@ -51,6 +65,7 @@ const Frame = struct {
     lo: u32,
     hi: u32,
     depth: u32,
+    /// The parent's item index in the top walk, its cell index in a job.
     parent: u32,
     slot: u32,
     sorted: bool,
@@ -59,6 +74,16 @@ const Frame = struct {
     x1: f64,
     y1: f64,
 };
+
+/// A cell of the top walk, or the root of a job subtree (`job` != NONE).
+const Item = struct { f: Frame, job: u32, index: u32 = 0 };
+
+/// A subtree emitted by one job: `cells` cells from `base`, preorder.
+pub const Job = struct { f: Frame, base: u32 = 0, cells: u32 = 0, depth: u32 = 0, overflow: bool = false };
+
+/// One chunk of nodes: its bounding box and point count, then the first
+/// perm and rest positions it writes; for run boundaries, its count and base.
+const Row = struct { x0: f64, y0: f64, x1: f64, y1: f64, count: u32, first: u32 = 0, rest: u32 = 0 };
 
 pub const Tree = struct {
     /// Extent after `cover`, as `tree._x0, _y0, _x1, _y1`; NaN when empty.
@@ -74,31 +99,46 @@ pub const Tree = struct {
     keys_tmp: []u64 = &.{},
     /// diff[k] = number of positions in perm[1..k] that differ from their predecessor.
     diff: []u32 = &.{},
-    stack: []Frame = &.{},
-    /// Traversal stack for the force kernels' inlined `visit`; every cell is
-    /// pushed at most once per traversal, so `len` entries always suffice.
-    vstack: []u32 = &.{},
+    /// Nodes with a NaN coordinate, in index order: n − m of them.
+    rest: []u32 = &.{},
     cap: u32 = 0,
+    /// The deepest cell's depth (root 0), so walks can size their stacks.
+    depth: u32 = 0,
+    /// Job subtrees and top cells (preorder) of the last build, for kernels
+    /// that sweep the tree by subtree (TRD 3, "The cut").
+    jobs: []Job = &.{},
+    n_jobs: u32 = 0,
+    tops: []u32 = &.{},
+    n_tops: u32 = 0,
+    /// Stacks of depth-first walks, one row per thread: `walk_stride` cell
+    /// indices for the force kernels, `frame_cap` frames for the build.
+    walk: []u32 = &.{},
+    walk_stride: u32 = 0,
+    frames: []Frame = &.{},
+    frame_cap: u32 = 0,
+    /// Build scratch: the main thread's top-walk stack and items, per-chunk
+    /// rows and radix histograms.
+    stack: []Frame = &.{},
+    items: []Item = &.{},
+    n_items: u32 = 0,
+    rows: []Row = &.{},
+    hist: []u32 = &.{},
 
     pub fn deinit(t: *Tree, a: Allocator) void {
-        a.free(t.cells);
-        a.free(t.perm);
-        a.free(t.perm_tmp);
-        a.free(t.keys);
-        a.free(t.keys_tmp);
-        a.free(t.diff);
-        a.free(t.stack);
-        a.free(t.vstack);
+        inline for (.{ "cells", "perm", "perm_tmp", "keys", "keys_tmp", "diff", "rest", "jobs", "tops", "walk", "frames", "stack", "items", "rows", "hist" }) |name| a.free(@field(t, name));
         t.* = .{};
     }
 
     fn reserve(t: *Tree, a: Allocator, n: u32) !void {
+        const rows = pool.chunks(n, pool.chunkSize(CHUNK)) + 1;
+        if (t.rows.len < rows) t.rows = try a.realloc(t.rows, rows);
         if (n <= t.cap) return;
         t.perm = try a.realloc(t.perm, n);
         t.perm_tmp = try a.realloc(t.perm_tmp, n);
         t.keys = try a.realloc(t.keys, n);
         t.keys_tmp = try a.realloc(t.keys_tmp, n);
         t.diff = try a.realloc(t.diff, n);
+        t.rest = try a.realloc(t.rest, n);
         const cells = 2 * @as(usize, n) + 64;
         if (t.cells.len < cells) t.cells = try a.realloc(t.cells, cells);
         if (t.stack.len < 256) t.stack = try a.realloc(t.stack, 256);
@@ -150,24 +190,159 @@ pub const Tree = struct {
     /// NaN are skipped, exactly as `addAll` skips them.
     pub fn build(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !void {
         if (!try t.prepare(a, xs, ys)) return;
+        try t.runBoundaries(xs, ys);
+        try t.emit(a, xs, ys);
+        try t.reserveWalks(a);
+    }
 
-        // Run boundaries between distinct positions, in sorted order.
-        const m = t.m;
-        t.diff[0] = 0;
-        for (1..m) |k| {
-            const p = t.perm[k];
-            const q = t.perm[k - 1];
-            t.diff[k] = t.diff[k - 1] + @intFromBool(xs[p] != xs[q] or ys[p] != ys[q]);
+    /// Sizes the per-thread walk stacks for the tree just built: a
+    /// depth-first walk that pushes up to four children holds at most
+    /// 3 · depth + 1 cells.
+    pub fn reserveWalks(t: *Tree, a: Allocator) !void {
+        t.walk_stride = 3 * t.depth + 4;
+        const need = @as(usize, pool.threads()) * t.walk_stride;
+        if (t.walk.len < need) t.walk = try a.realloc(t.walk, need);
+    }
+
+    /// One thread's walk stack.
+    pub fn walkStack(t: *const Tree, tid: u32) []u32 {
+        return t.walk[tid * t.walk_stride ..][0..t.walk_stride];
+    }
+
+    // Steps 1 and 2: bounding box, compaction, keys.
+
+    const Prep = struct {
+        t: *Tree,
+        xs: []const f64,
+        ys: []const f64,
+        size: u32,
+        fast_scale: f64 = 0,
+
+        /// Rows [BOX_ROWS · task, BOX_ROWS · (task + 1)) of the box pass.
+        fn boxes(p: *const Prep, task: u32, _: u32) void {
+            const rows = pool.chunks(@intCast(p.xs.len), p.size);
+            const r = pool.range(rows, BOX_ROWS, task);
+            for (r.lo..r.hi) |c| p.box(@intCast(c));
         }
 
-        try t.emit(a, xs, ys);
-        if (t.vstack.len < t.len) t.vstack = try a.realloc(t.vstack, t.cells.len);
+        /// Bounding box with addAll's comparisons (first of -0 / 0 wins) and
+        /// the count of points without a NaN coordinate.
+        fn box(p: *const Prep, c: u32) void {
+            const r = pool.range(@intCast(p.xs.len), p.size, c);
+            var bx0 = std.math.inf(f64);
+            var by0 = std.math.inf(f64);
+            var bx1 = -std.math.inf(f64);
+            var by1 = -std.math.inf(f64);
+            var m: u32 = 0;
+            for (r.lo..r.hi) |i| {
+                const x = p.xs[i];
+                const y = p.ys[i];
+                if (x != x or y != y) continue;
+                if (x < bx0) bx0 = x;
+                if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y;
+                if (y > by1) by1 = y;
+                m += 1;
+            }
+            p.t.rows[c] = .{ .x0 = bx0, .y0 = by0, .x1 = bx1, .y1 = by1, .count = m };
+        }
+
+        /// Writes the chunk's points to perm (and the rest to `rest`) at the
+        /// offsets the main thread put in its row, with d3's Morton keys.
+        fn exactKeys(p: *const Prep, c: u32, _: u32) void {
+            const t = p.t;
+            const r = pool.range(@intCast(p.xs.len), p.size, c);
+            var k = t.rows[c].first;
+            var rest = t.rows[c].rest;
+            const e = t.extent;
+            for (r.lo..r.hi) |i| {
+                const x = p.xs[i];
+                const y = p.ys[i];
+                if (x != x or y != y) {
+                    t.rest[rest] = @intCast(i);
+                    rest += 1;
+                    continue;
+                }
+                var x0 = e[0];
+                var y0 = e[1];
+                var x1 = e[2];
+                var y1 = e[3];
+                var key: u64 = 0;
+                inline for (0..KEY_LEVELS) |_| {
+                    const xm = (x0 + x1) / 2;
+                    const ym = (y0 + y1) / 2;
+                    const right = x >= xm;
+                    if (right) x0 = xm else x1 = xm;
+                    const bottom = y >= ym;
+                    if (bottom) y0 = ym else y1 = ym;
+                    key = key << 2 | @as(u64, @intFromBool(bottom)) << 1 | @intFromBool(right);
+                }
+                t.perm[k] = @intCast(i);
+                t.keys[k] = key;
+                k += 1;
+            }
+        }
+
+        /// The fast tree's keys: 16 quantised bits per axis.
+        fn fastKeys(p: *const Prep, c: u32, _: u32) void {
+            const t = p.t;
+            const r = pool.range(@intCast(p.xs.len), p.size, c);
+            var k = t.rows[c].first;
+            var rest = t.rows[c].rest;
+            const bx0 = t.extent[0];
+            const by0 = t.extent[1];
+            const scale = p.fast_scale;
+            for (r.lo..r.hi) |i| {
+                const x = p.xs[i];
+                const y = p.ys[i];
+                if (x != x or y != y) {
+                    t.rest[rest] = @intCast(i);
+                    rest += 1;
+                    continue;
+                }
+                const qx: u32 = @intFromFloat(@min(65535, @floor((x - bx0) * scale)));
+                const qy: u32 = @intFromFloat(@min(65535, @floor((y - by0) * scale)));
+                t.perm[k] = @intCast(i);
+                t.keys[k] = spread16(qx) | spread16(qy) << 1;
+                k += 1;
+            }
+        }
+    };
+
+    /// Runs the box pass and combines its rows in chunk order with the same
+    /// comparisons, so the box is the serial scan's, signed zeros included,
+    /// and sets each row's first perm and rest positions for the key pass.
+    /// Returns the box, or null when no point has finite coordinates.
+    fn box(t: *Tree, p: *const Prep, n_chunks: u32) !?[4]f64 {
+        try pool.parallelFor(p, pool.chunks(n_chunks, BOX_ROWS), Prep.boxes);
+        var bx0 = std.math.inf(f64);
+        var by0 = std.math.inf(f64);
+        var bx1 = -std.math.inf(f64);
+        var by1 = -std.math.inf(f64);
+        var m: u32 = 0;
+        var rest: u32 = 0;
+        for (t.rows[0..n_chunks], 0..) |*row, c| {
+            if (row.count > 0) {
+                if (row.x0 < bx0) bx0 = row.x0;
+                if (row.x1 > bx1) bx1 = row.x1;
+                if (row.y0 < by0) by0 = row.y0;
+                if (row.y1 > by1) by1 = row.y1;
+            }
+            const r = pool.range(@intCast(p.xs.len), p.size, @intCast(c));
+            row.first = m;
+            row.rest = rest;
+            m += row.count;
+            rest += (r.hi - r.lo) - row.count;
+        }
+        t.m = m;
+        if (bx0 > bx1 or by0 > by1) return null;
+        return .{ bx0, by0, bx1, by1 };
     }
 
     /// Fast-mode variant of `prepare` (TRD 2, fast tree): a square extent over
     /// the bounding box, 16 quantised bits per axis interleaved into a 32-bit
-    /// Morton key, so the radix sort skips its four constant top bytes. The
-    /// midpoint semantics of d3-quadtree are not needed for the FMM tree.
+    /// Morton key, so the radix sort runs four passes. The midpoint semantics
+    /// of d3-quadtree are not needed for the FMM tree.
     pub fn prepareFast(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !bool {
         const n: u32 = @intCast(xs.len);
         try t.reserve(a, n);
@@ -175,34 +350,16 @@ pub const Tree = struct {
         t.extent = .{ nan, nan, nan, nan };
         t.len = 0;
         t.root = NONE;
-        var bx0 = std.math.inf(f64);
-        var by0 = std.math.inf(f64);
-        var bx1 = -std.math.inf(f64);
-        var by1 = -std.math.inf(f64);
-        var m: u32 = 0;
-        for (0..n) |i| {
-            const x = xs[i];
-            const y = ys[i];
-            if (x != x or y != y) continue;
-            if (x < bx0) bx0 = x;
-            if (x > bx1) bx1 = x;
-            if (y < by0) by0 = y;
-            if (y > by1) by1 = y;
-            t.perm[m] = @intCast(i);
-            m += 1;
-        }
-        t.m = m;
-        if (bx0 > bx1 or by0 > by1) return false;
-        var side = @max(bx1 - bx0, by1 - by0);
+        const size = pool.chunkSize(CHUNK);
+        const n_chunks = pool.chunks(n, size);
+        var p = Prep{ .t = t, .xs = xs, .ys = ys, .size = size };
+        const b = try t.box(&p, n_chunks) orelse return false;
+        var side = @max(b[2] - b[0], b[3] - b[1]);
         if (!(side > 0)) side = 1;
-        t.extent = .{ bx0, by0, bx0 + side, by0 + side };
-        const scale = 65536.0 / side;
-        for (t.perm[0..m], t.keys[0..m]) |i, *key| {
-            const qx: u32 = @intFromFloat(@min(65535, @floor((xs[i] - bx0) * scale)));
-            const qy: u32 = @intFromFloat(@min(65535, @floor((ys[i] - by0) * scale)));
-            key.* = spread16(qx) | spread16(qy) << 1;
-        }
-        t.radixSort(m);
+        t.extent = .{ b[0], b[1], b[0] + side, b[1] + side };
+        p.fast_scale = 65536.0 / side;
+        try pool.parallelFor(&p, n_chunks, Prep.fastKeys);
+        try sort.sort(u64, a, &t.keys, &t.perm, &t.keys_tmp, &t.perm_tmp, &t.hist, t.m, 4);
         return true;
     }
 
@@ -219,90 +376,63 @@ pub const Tree = struct {
         t.len = 0;
         t.root = NONE;
         t.m = 0;
-
-        // Bounding box with addAll's comparisons (first of -0 / 0 wins).
-        var bx0 = std.math.inf(f64);
-        var by0 = std.math.inf(f64);
-        var bx1 = -std.math.inf(f64);
-        var by1 = -std.math.inf(f64);
-        var m: u32 = 0;
-        for (0..n) |i| {
-            const x = xs[i];
-            const y = ys[i];
-            if (x != x or y != y) continue;
-            if (x < bx0) bx0 = x;
-            if (x > bx1) bx1 = x;
-            if (y < by0) by0 = y;
-            if (y > by1) by1 = y;
-            t.perm[m] = @intCast(i);
-            m += 1;
-        }
-        t.m = m;
-        if (bx0 > bx1 or by0 > by1) return false;
-        t.cover(bx0, by0);
-        t.cover(bx1, by1);
-
-        // Morton keys by d3's midpoint test.
-        const e = t.extent;
-        for (t.perm[0..m], t.keys[0..m]) |i, *key| {
-            const x = xs[i];
-            const y = ys[i];
-            var x0 = e[0];
-            var y0 = e[1];
-            var x1 = e[2];
-            var y1 = e[3];
-            var k: u64 = 0;
-            inline for (0..KEY_LEVELS) |_| {
-                const xm = (x0 + x1) / 2;
-                const ym = (y0 + y1) / 2;
-                const right = x >= xm;
-                if (right) x0 = xm else x1 = xm;
-                const bottom = y >= ym;
-                if (bottom) y0 = ym else y1 = ym;
-                k = k << 2 | @as(u64, @intFromBool(bottom)) << 1 | @intFromBool(right);
-            }
-            key.* = k;
-        }
-
-        t.radixSort(m);
+        const size = pool.chunkSize(CHUNK);
+        const n_chunks = pool.chunks(n, size);
+        const p = Prep{ .t = t, .xs = xs, .ys = ys, .size = size };
+        const b = try t.box(&p, n_chunks) orelse return false;
+        t.cover(b[0], b[1]);
+        t.cover(b[2], b[3]);
+        try pool.parallelFor(&p, n_chunks, Prep.exactKeys);
+        try sort.sort(u64, a, &t.keys, &t.perm, &t.keys_tmp, &t.perm_tmp, &t.hist, t.m, 8);
         return true;
     }
 
-    /// Stable 8-pass LSD radix sort of keys[0..m] carrying perm; passes whose
-    /// byte is constant across all keys are skipped.
-    fn radixSort(t: *Tree, m: u32) void {
-        var src_k = t.keys;
-        var src_p = t.perm;
-        var dst_k = t.keys_tmp;
-        var dst_p = t.perm_tmp;
-        var hist: [256]u32 = undefined;
-        var shift: u6 = 0;
-        while (true) : (shift += 8) {
-            @memset(&hist, 0);
-            for (src_k[0..m]) |k| hist[@as(u8, @truncate(k >> shift))] += 1;
-            if (hist[@as(u8, @truncate(src_k[0] >> shift))] != m) {
-                var sum: u32 = 0;
-                for (&hist) |*h| {
-                    const c = h.*;
-                    h.* = sum;
-                    sum += c;
-                }
-                for (src_k[0..m], src_p[0..m]) |k, p| {
-                    const b = @as(u8, @truncate(k >> shift));
-                    dst_k[hist[b]] = k;
-                    dst_p[hist[b]] = p;
-                    hist[b] += 1;
-                }
-                std.mem.swap([]u64, &src_k, &dst_k);
-                std.mem.swap([]u32, &src_p, &dst_p);
-            }
-            if (shift == 56) break;
+    // Step 3b: run boundaries between distinct positions, in sorted order.
+
+    const Runs = struct {
+        t: *Tree,
+        xs: []const f64,
+        ys: []const f64,
+        size: u32,
+
+        inline fn differs(r: *const Runs, k: usize) u32 {
+            const p = r.t.perm[k];
+            const q = r.t.perm[k - 1];
+            return @intFromBool(r.xs[p] != r.xs[q] or r.ys[p] != r.ys[q]);
         }
-        t.keys = src_k;
-        t.perm = src_p;
-        t.keys_tmp = dst_k;
-        t.perm_tmp = dst_p;
+
+        fn count(r: *const Runs, c: u32, _: u32) void {
+            const g = pool.range(r.t.m, r.size, c);
+            var d: u32 = 0;
+            for (@max(g.lo, 1)..g.hi) |k| d += r.differs(k);
+            r.t.rows[c].count = d;
+        }
+
+        fn write(r: *const Runs, c: u32, _: u32) void {
+            const g = pool.range(r.t.m, r.size, c);
+            var d = r.t.rows[c].first;
+            if (g.lo == 0) r.t.diff[0] = 0;
+            for (@max(g.lo, 1)..g.hi) |k| {
+                d += r.differs(k);
+                r.t.diff[k] = d;
+            }
+        }
+    };
+
+    fn runBoundaries(t: *Tree, xs: []const f64, ys: []const f64) !void {
+        const size = pool.chunkSize(RUN_CHUNK);
+        const n_chunks = pool.chunks(t.m, size);
+        const r = Runs{ .t = t, .xs = xs, .ys = ys, .size = size };
+        try pool.parallelFor(&r, n_chunks, Runs.count);
+        var base: u32 = 0;
+        for (t.rows[0..n_chunks]) |*row| {
+            row.first = base;
+            base += row.count;
+        }
+        try pool.parallelFor(&r, n_chunks, Runs.write);
     }
+
+    // Step 4: cells.
 
     fn allSame(t: *const Tree, f: Frame, xs: []const f64, ys: []const f64) bool {
         if (f.sorted) return t.diff[f.hi - 1] == t.diff[f.lo];
@@ -313,78 +443,207 @@ pub const Tree = struct {
         return true;
     }
 
+    /// The four child ranges of f, in split[0..5]. Below the key resolution
+    /// it stably partitions perm[f.lo..f.hi] by d3's midpoint test, which is
+    /// idempotent, so a subtree can be walked twice.
+    noinline fn split(t: *Tree, f: Frame, xs: []const f64, ys: []const f64, out: *[5]u32) void {
+        out[0] = f.lo;
+        out[4] = f.hi;
+        if (f.sorted and f.depth < KEY_LEVELS) {
+            // Children are contiguous key ranges; find the three boundaries.
+            const shift: u6 = @intCast(62 - 2 * f.depth);
+            var k = f.lo;
+            for (1..4) |q| {
+                while (k < f.hi and (t.keys[k] >> shift & 3) < q) k += 1;
+                out[q] = k;
+            }
+        } else {
+            const xm = (f.x0 + f.x1) / 2;
+            const ym = (f.y0 + f.y1) / 2;
+            var counts = [4]u32{ 0, 0, 0, 0 };
+            for (t.perm[f.lo..f.hi]) |p| counts[quadrant(xs[p], ys[p], xm, ym)] += 1;
+            var off: [4]u32 = undefined;
+            var sum = f.lo;
+            for (0..4) |q| {
+                off[q] = sum;
+                out[q] = sum;
+                sum += counts[q];
+            }
+            for (t.perm[f.lo..f.hi]) |p| {
+                const q = quadrant(xs[p], ys[p], xm, ym);
+                t.perm_tmp[off[q]] = p;
+                off[q] += 1;
+            }
+            @memcpy(t.perm[f.lo..f.hi], t.perm_tmp[f.lo..f.hi]);
+        }
+    }
+
+    /// The child frame of f in quadrant q over keys [lo, hi).
+    fn child(f: Frame, q: u32, lo: u32, hi: u32, parent: u32) Frame {
+        const xm = (f.x0 + f.x1) / 2;
+        const ym = (f.y0 + f.y1) / 2;
+        const right = q & 1 != 0;
+        const bottom = q & 2 != 0;
+        return .{
+            .lo = lo,
+            .hi = hi,
+            .depth = f.depth + 1,
+            .parent = parent,
+            .slot = q,
+            .sorted = f.sorted and f.depth < KEY_LEVELS,
+            .x0 = if (right) xm else f.x0,
+            .y0 = if (bottom) ym else f.y0,
+            .x1 = if (right) f.x1 else xm,
+            .y1 = if (bottom) f.y1 else ym,
+        };
+    }
+
+    fn leafCell(f: Frame) Cell {
+        return .{ .child = .{ NONE, NONE, NONE, NONE }, .first = f.lo, .count = f.hi - f.lo, .x0 = f.x0, .y0 = f.y0, .x1 = f.x1, .y1 = f.y1 };
+    }
+
+    const Emit = struct {
+        t: *Tree,
+        xs: []const f64,
+        ys: []const f64,
+
+        /// Walks job j's subtree depth first, exactly as the serial build
+        /// would: counts its cells and depth, or with `write` emits them from
+        /// its base. A full stack marks the job for a rerun.
+        fn walk(e: *const Emit, write: bool, j: u32, tid: u32) void {
+            const t = e.t;
+            const job = &t.jobs[j];
+            const stack = t.frames[tid * t.frame_cap ..][0..t.frame_cap];
+            var sp: usize = 1;
+            stack[0] = job.f;
+            stack[0].parent = NONE;
+            var idx = job.base;
+            var depth: u32 = 0;
+            while (sp > 0) {
+                sp -= 1;
+                const f = stack[sp];
+                if (write) {
+                    t.cells[idx] = leafCell(f);
+                    if (f.parent != NONE) t.cells[f.parent].child[f.slot] = idx;
+                }
+                const me = idx;
+                idx += 1;
+                depth = @max(depth, f.depth);
+                if (f.depth >= MAX_DEPTH or t.allSame(f, e.xs, e.ys)) continue;
+                var sp5: [5]u32 = undefined;
+                t.split(f, e.xs, e.ys, &sp5);
+                var q: u32 = 4;
+                while (q > 0) {
+                    q -= 1;
+                    if (sp5[q] == sp5[q + 1]) continue;
+                    if (sp == stack.len) {
+                        job.overflow = true;
+                        return;
+                    }
+                    stack[sp] = child(f, q, sp5[q], sp5[q + 1], me);
+                    sp += 1;
+                }
+            }
+            job.cells = idx - job.base;
+            job.depth = depth;
+        }
+
+        fn count(e: *const Emit, j: u32, tid: u32) void {
+            e.walk(false, j, tid);
+        }
+
+        fn emit(e: *const Emit, j: u32, tid: u32) void {
+            e.walk(true, j, tid);
+        }
+    };
+
     fn push(t: *Tree, a: Allocator, sp: *usize, f: Frame) !void {
         if (sp.* == t.stack.len) t.stack = try a.realloc(t.stack, t.stack.len * 2);
         t.stack[sp.*] = f;
         sp.* += 1;
     }
 
+    fn addItem(t: *Tree, a: Allocator, item: Item) !void {
+        if (t.n_items == t.items.len) t.items = try a.realloc(t.items, @max(64, 2 * t.items.len));
+        t.items[t.n_items] = item;
+        t.n_items += 1;
+    }
+
     fn emit(t: *Tree, a: Allocator, xs: []const f64, ys: []const f64) !void {
+        const limit = pool.cutLimit(t.m);
         const e = t.extent;
+
+        // The top walk, on the main thread: the serial build's preorder walk,
+        // stopped at subtrees of at most `limit` points, which become jobs.
+        t.n_items = 0;
+        t.n_jobs = 0;
+        var depth: u32 = 0;
         var sp: usize = 0;
         try t.push(a, &sp, .{ .lo = 0, .hi = t.m, .depth = 0, .parent = NONE, .slot = 0, .sorted = true, .x0 = e[0], .y0 = e[1], .x1 = e[2], .y1 = e[3] });
         while (sp > 0) {
             sp -= 1;
             const f = t.stack[sp];
-            if (t.len == t.cells.len) t.cells = try a.realloc(t.cells, t.cells.len * 2);
-            const idx = t.len;
-            t.len += 1;
-            t.cells[idx] = .{ .child = .{ NONE, NONE, NONE, NONE }, .first = f.lo, .count = f.hi - f.lo, .x0 = f.x0, .y0 = f.y0, .x1 = f.x1, .y1 = f.y1 };
-            if (f.parent == NONE) t.root = idx else t.cells[f.parent].child[f.slot] = idx;
-            if (f.depth >= MAX_DEPTH or t.allSame(f, xs, ys)) continue;
-
-            const xm = (f.x0 + f.x1) / 2;
-            const ym = (f.y0 + f.y1) / 2;
-            var split: [5]u32 = undefined;
-            split[0] = f.lo;
-            split[4] = f.hi;
-            if (f.sorted and f.depth < KEY_LEVELS) {
-                // Children are contiguous key ranges; find the three boundaries.
-                const shift: u6 = @intCast(62 - 2 * f.depth);
-                var k = f.lo;
-                for (1..4) |q| {
-                    while (k < f.hi and (t.keys[k] >> shift & 3) < q) k += 1;
-                    split[q] = k;
-                }
-            } else {
-                // Below the key resolution: stable partition by d3's midpoint test.
-                var counts = [4]u32{ 0, 0, 0, 0 };
-                for (t.perm[f.lo..f.hi]) |p| counts[quadrant(xs[p], ys[p], xm, ym)] += 1;
-                var off: [4]u32 = undefined;
-                var sum = f.lo;
-                for (0..4) |q| {
-                    off[q] = sum;
-                    split[q] = sum;
-                    sum += counts[q];
-                }
-                for (t.perm[f.lo..f.hi]) |p| {
-                    const q = quadrant(xs[p], ys[p], xm, ym);
-                    t.perm_tmp[off[q]] = p;
-                    off[q] += 1;
-                }
-                @memcpy(t.perm[f.lo..f.hi], t.perm_tmp[f.lo..f.hi]);
+            if (f.hi - f.lo <= limit) {
+                if (t.n_jobs == t.jobs.len) t.jobs = try a.realloc(t.jobs, @max(64, 2 * t.jobs.len));
+                t.jobs[t.n_jobs] = .{ .f = f };
+                try t.addItem(a, .{ .f = f, .job = t.n_jobs });
+                t.n_jobs += 1;
+                continue;
             }
-            const sorted = f.sorted and f.depth < KEY_LEVELS;
+            try t.addItem(a, .{ .f = f, .job = NONE });
+            const it = t.n_items - 1;
+            depth = @max(depth, f.depth);
+            if (f.depth >= MAX_DEPTH or t.allSame(f, xs, ys)) continue;
+            var sp5: [5]u32 = undefined;
+            t.split(f, xs, ys, &sp5);
             var q: u32 = 4;
             while (q > 0) {
                 q -= 1;
-                if (split[q] == split[q + 1]) continue;
-                const right = q & 1 != 0;
-                const bottom = q & 2 != 0;
-                try t.push(a, &sp, .{
-                    .lo = split[q],
-                    .hi = split[q + 1],
-                    .depth = f.depth + 1,
-                    .parent = idx,
-                    .slot = q,
-                    .sorted = sorted,
-                    .x0 = if (right) xm else f.x0,
-                    .y0 = if (bottom) ym else f.y0,
-                    .x1 = if (right) f.x1 else xm,
-                    .y1 = if (bottom) f.y1 else ym,
-                });
+                if (sp5[q] == sp5[q + 1]) continue;
+                try t.push(a, &sp, child(f, q, sp5[q], sp5[q + 1], it));
             }
         }
+
+        // Count each job's cells, growing the walk stacks until none overflows.
+        const em = Emit{ .t = t, .xs = xs, .ys = ys };
+        if (t.frame_cap == 0) t.frame_cap = 256;
+        while (true) {
+            const need = @as(usize, pool.threads()) * t.frame_cap;
+            if (t.frames.len < need) t.frames = try a.realloc(t.frames, need);
+            for (t.jobs[0..t.n_jobs]) |*j| j.overflow = false;
+            try pool.parallelFor(&em, t.n_jobs, Emit.count);
+            var overflow = false;
+            for (t.jobs[0..t.n_jobs]) |j| overflow = overflow or j.overflow;
+            if (!overflow) break;
+            t.frame_cap *= 4;
+        }
+
+        // Indices: top cells and job subtrees interleave in preorder.
+        var next: u32 = 0;
+        if (t.tops.len < t.n_items) t.tops = try a.realloc(t.tops, t.items.len);
+        t.n_tops = 0;
+        for (t.items[0..t.n_items]) |*item| {
+            item.index = next;
+            if (item.job == NONE) {
+                next += 1;
+                t.tops[t.n_tops] = item.index;
+                t.n_tops += 1;
+            } else {
+                const j = &t.jobs[item.job];
+                j.base = next;
+                next += j.cells;
+                depth = @max(depth, j.depth);
+            }
+        }
+        if (t.cells.len < next) t.cells = try a.realloc(t.cells, next);
+        for (t.items[0..t.n_items]) |item| {
+            if (item.job == NONE) t.cells[item.index] = leafCell(item.f);
+            if (item.f.parent != NONE) t.cells[t.items[item.f.parent].index].child[item.f.slot] = item.index;
+        }
+        t.root = 0;
+        t.len = next;
+        t.depth = depth;
+        try pool.parallelFor(&em, t.n_jobs, Emit.emit);
     }
 
     /// Writes cell indices in the order d3-quadtree calls back: `visit` (preorder,

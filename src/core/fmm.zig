@@ -9,18 +9,32 @@
 //! back by 1 / width. Near-field pairs use d3's own pair formula, including
 //! distanceMin, distanceMax and jiggle, with jiggle drawn from hash.zig.
 //!
+//! On the thread pool (TRD 3, Kernels: "Fast mode") the tree is cut into job
+//! subtrees. Upward runs per subtree, then over the top cells on the main
+//! thread. The top traversal is the serial recursion from (root, root), except
+//! that a call whose target is a cut cell is queued for that cell's job;
+//! everything such a call writes lies in the cut cell's subtree, and the
+//! serial recursion would have made the cell's calls in queue order. Each job
+//! then runs its queue, unscales its cells and only then takes its parent's
+//! L2L, as the serial downward pass does after the traversal. So every local
+//! expansion and every velocity receives the same additions in the same order
+//! as on one thread, whatever the cut and whichever thread runs a job.
+//!
 //! The hot loops are vectorised by hand (two f64 lanes) rather than with a
 //! relaxed float mode, which would also let the compiler assume away the NaN
 //! and Infinity cases d3's semantics depend on. No @mulAdd: wasm has no fused
 //! multiply-add and would call a software routine.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Sim = @import("sim.zig").Sim;
 const Force = @import("force.zig").Force;
 const tree_mod = @import("tree.zig");
 const hash = @import("hash.zig");
 const clock = @import("clock.zig");
+const pool = @import("pool.zig");
+const NONE = tree_mod.NONE;
 
 pub const MAX_ORDER: u32 = 24;
 pub const DEFAULT_ORDER: u32 = 8;
@@ -39,7 +53,9 @@ const MIN_SEP2: f64 = 1e-28;
 const V = @Vector(2, f64);
 
 /// Interaction counters and phase timers for the native benchmark
-/// (src/core/bench.zig); a few increments per cell pair.
+/// (src/core/bench.zig); a few increments per cell pair, kept out of the wasm
+/// builds, where threads would contend for them.
+const track = !builtin.target.cpu.arch.isWasm();
 pub const Stats = struct { m2l: u64 = 0, p2p_calls: u64 = 0, p2p_pairs: u64 = 0, visits: u64 = 0 };
 pub var stats: Stats = .{};
 /// Nanoseconds per phase of the last run: cells, geometry, upward, traversal,
@@ -60,6 +76,16 @@ pub const Cell = extern struct {
     depth: u32,
     _pad: u32 = 0,
 };
+
+/// A job subtree: its root, the root's parent (NONE for the tree's root),
+/// and its slice of the grouped deferred calls.
+const Job = struct { root: u32, parent: u32, q_first: u32 = 0, q_count: u32 = 0 };
+
+const Deferred = struct { job: u32, b: u32 };
+
+/// Cells per chunk of the per-cell passes, points per chunk of the gather.
+const CELL_CHUNK: u32 = 512;
+const POINT_CHUNK: u32 = 16384;
 
 pub const Fmm = struct {
     len: u32 = 0,
@@ -90,10 +116,80 @@ pub const Fmm = struct {
     bstride: usize = 0,
     binom_p: u32 = 0,
     fact: [2 * MAX_ORDER + 2]f64 = undefined,
+    /// The cut (TRD 3): job subtrees in Morton order, the top cells above them
+    /// in preorder (parents before children), and per cell its job when it is
+    /// a job root, else NONE. Only top cells and job roots are ever looked up.
+    jobs: []Job = &.{},
+    n_jobs: u32 = 0,
+    tops: []u32 = &.{},
+    n_tops: u32 = 0,
+    job_of: []u32 = &.{},
+    /// Calls the top traversal deferred, in order, then grouped by job.
+    queue: []Deferred = &.{},
+    queue_len: u32 = 0,
+    queue_b: []u32 = &.{},
 
     pub fn deinit(f: *Fmm, a: Allocator) void {
-        inline for (.{ "cells", "ux", "uy", "px", "py", "ps", "bx0", "by0", "bx1", "by1", "m", "l", "binom" }) |name| a.free(@field(f, name));
+        inline for (.{ "cells", "ux", "uy", "px", "py", "ps", "bx0", "by0", "bx1", "by1", "m", "l", "binom", "jobs", "tops", "job_of", "queue", "queue_b" }) |name| a.free(@field(f, name));
         f.* = .{};
+    }
+
+    /// Finds the cut: walking down from the root, the first cell on each path
+    /// that holds at most `limit` points, or is a leaf, roots a job.
+    fn cut(f: *Fmm, a: Allocator, limit: u32) !void {
+        if (f.job_of.len < f.len) f.job_of = try a.realloc(f.job_of, f.cap);
+        @memset(f.job_of[0..f.len], NONE);
+        f.n_jobs = 0;
+        f.n_tops = 0;
+        // Depth is at most LEVELS, so a depth-first stack of 4 · LEVELS suffices.
+        var stack: [4 * LEVELS + 4][2]u32 = undefined;
+        var sp: usize = 1;
+        stack[0] = .{ 0, NONE };
+        while (sp > 0) {
+            sp -= 1;
+            const c = stack[sp][0];
+            const cell = &f.cells[c];
+            if (cell.count <= limit or cell.nchild == 0) {
+                if (f.n_jobs == f.jobs.len) f.jobs = try a.realloc(f.jobs, @max(64, 2 * f.jobs.len));
+                f.jobs[f.n_jobs] = .{ .root = c, .parent = stack[sp][1] };
+                f.job_of[c] = f.n_jobs;
+                f.n_jobs += 1;
+                continue;
+            }
+            if (f.n_tops == f.tops.len) f.tops = try a.realloc(f.tops, @max(64, 2 * f.tops.len));
+            f.tops[f.n_tops] = c;
+            f.n_tops += 1;
+            var k = cell.nchild;
+            while (k > 0) {
+                k -= 1;
+                stack[sp] = .{ cell.child0 + k, c };
+                sp += 1;
+            }
+        }
+    }
+
+    fn enqueue(f: *Fmm, a: Allocator, j: u32, b: u32) Allocator.Error!void {
+        if (f.queue_len == f.queue.len) f.queue = try a.realloc(f.queue, @max(256, 2 * f.queue.len));
+        f.queue[f.queue_len] = .{ .job = j, .b = b };
+        f.queue_len += 1;
+    }
+
+    /// Groups the deferred calls by job, keeping their order within a job.
+    fn groupQueue(f: *Fmm, a: Allocator) !void {
+        if (f.queue_b.len < f.queue_len) f.queue_b = try a.realloc(f.queue_b, f.queue.len);
+        for (f.jobs[0..f.n_jobs]) |*j| j.q_count = 0;
+        for (f.queue[0..f.queue_len]) |q| f.jobs[q.job].q_count += 1;
+        var first: u32 = 0;
+        for (f.jobs[0..f.n_jobs]) |*j| {
+            j.q_first = first;
+            first += j.q_count;
+            j.q_count = 0;
+        }
+        for (f.queue[0..f.queue_len]) |q| {
+            const j = &f.jobs[q.job];
+            f.queue_b[j.q_first + j.q_count] = q.b;
+            j.q_count += 1;
+        }
     }
 
     fn reserveCells(f: *Fmm, a: Allocator, cap: u32) !void {
@@ -170,14 +266,11 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, alpha: f64) !bool {
     try fm.binomials(a, p);
     tick = clock.now();
     try buildCells(fm, a, t);
+    try fm.cut(a, pool.cutLimit(t.m));
     phase_ns[0] = clock.now() - tick;
-    const nc: usize = fm.len;
+    const nc: u32 = fm.len;
     const stride: usize = 2 * (p + 1);
-    tick = clock.now();
     try fm.reserveCoefs(a, nc * stride);
-    @memset(fm.m[0 .. nc * stride], 0);
-    @memset(fm.l[0 .. nc * stride], 0);
-    phase_ns[6] = clock.now() - tick;
 
     var dmax_scaled: f64 = std.math.inf(f64);
     const dmax2 = f.scalar(.distance_max2);
@@ -185,27 +278,11 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, alpha: f64) !bool {
     const dmin2 = f.scalar(.distance_min2);
     const dmin_scaled: f64 = if (dmin2 > 0) @sqrt(dmin2) / w else 0;
 
-    // Gather the points into Morton order once (TRD 2: a thread's nodes are
-    // spatially close and stream through memory).
     try fm.reservePoints(a, t.m);
-    const ox = (e[0] + e[2]) / 2;
-    const oy = (e[1] + e[3]) / 2;
     const inv_w = 1 / w;
-    for (t.perm[0..t.m], 0..) |i, k| {
-        const x = s.x[i];
-        const y = s.y[i];
-        fm.px[k] = x;
-        fm.py[k] = y;
-        // Strength times alpha, with NaN strengths contributing nothing (d3's
-        // `!quad.value` in effect), so the kernels need neither per pair.
-        const st = f.f0[i] * alpha;
-        fm.ps[k] = if (st != st) 0 else st;
-        fm.ux[k] = (x - ox) * inv_w;
-        fm.uy[k] = (y - oy) * inv_w;
-    }
-
     var ctx = Ctx{
         .fm = fm,
+        .a = a,
         .cells = fm.cells.ptr,
         .perm = t.perm[0..t.m],
         .ux = fm.ux,
@@ -215,6 +292,11 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, alpha: f64) !bool {
         .ps = fm.ps,
         .vx = s.vx,
         .vy = s.vy,
+        .xs = s.x,
+        .ys = s.y,
+        .strengths = f.f0,
+        .ox = (e[0] + e[2]) / 2,
+        .oy = (e[1] + e[3]) / 2,
         .alpha = alpha,
         .p = p,
         .stride = stride,
@@ -227,31 +309,53 @@ pub fn run(s: *Sim, a: Allocator, f: *const Force, alpha: f64) !bool {
         .dmin2 = dmin2,
         .dmax2 = dmax2,
         .seed = hash.seedFrom(f.scalar(.seed)),
+        .cell_size = pool.chunkSize(CELL_CHUNK),
+        .point_size = pool.chunkSize(POINT_CHUNK),
         .dpow = undefined,
     };
 
+    // Zero the expansions and gather the points into Morton order once
+    // (TRD 2: a thread's nodes are spatially close and stream through memory).
     tick = clock.now();
-    geometry(&ctx);
+    try pool.parallelFor(&ctx, pool.chunks(nc, ctx.cell_size), zeroChunk);
+    try pool.parallelFor(&ctx, pool.chunks(t.m, ctx.point_size), gatherChunk);
+    phase_ns[6] = clock.now() - tick;
+
+    // Geometry, P2M and M2M per subtree, then the top cells; then M_k / k!.
+    tick = clock.now();
+    try pool.parallelFor(&ctx, fm.n_jobs, upJob);
+    var k = fm.n_tops;
+    while (k > 0) {
+        k -= 1;
+        geometryCell(&ctx, fm.tops[k]);
+        upwardCell(&ctx, fm.tops[k]);
+    }
+    try pool.parallelFor(&ctx, pool.chunks(nc, ctx.cell_size), scaleChunk);
     var t1 = clock.now();
-    phase_ns[1] = t1 - tick;
-    tick = t1;
-    upward(&ctx);
-    scaleForM2l(&ctx);
-    t1 = clock.now();
+    phase_ns[1] = 0;
     phase_ns[2] = t1 - tick;
+
+    // The top traversal, deferring calls on cut cells to their jobs.
     tick = t1;
-    ctx.interact(0, 0);
+    fm.queue_len = 0;
+    try ctx.interact(true, 0, 0);
+    try fm.groupQueue(a);
+    // The downward pass inside the top part, stopping at the cut.
+    for (fm.tops[0..fm.n_tops]) |i| unscaleCell(&ctx, i);
+    for (fm.tops[0..fm.n_tops]) |i| downwardCell(&ctx, true, i);
     t1 = clock.now();
     phase_ns[3] = t1 - tick;
+
+    // Each job: its deferred calls, unscale, its parent's L2L, downward.
     tick = t1;
-    unscaleAfterM2l(&ctx);
-    downward(&ctx);
+    try pool.parallelFor(&ctx, fm.n_jobs, downJob);
     phase_ns[4] = clock.now() - tick;
     return true;
 }
 
 const Ctx = struct {
     fm: *Fmm,
+    a: Allocator,
     cells: [*]Cell,
     perm: []const u32,
     /// Morton-ordered points: scaled, raw, strength (see Fmm).
@@ -262,6 +366,12 @@ const Ctx = struct {
     ps: []const f64,
     vx: []f64,
     vy: []f64,
+    /// Inputs of the gather: raw positions, strengths, the extent's centre.
+    xs: []const f64,
+    ys: []const f64,
+    strengths: []const f64,
+    ox: f64,
+    oy: f64,
     alpha: f64,
     p: u32,
     stride: usize,
@@ -278,12 +388,21 @@ const Ctx = struct {
     dmin2: f64,
     dmax2: f64,
     seed: u64,
-    /// Scratch: shift powers for M2M and L2L, planar (see shiftPowers).
+    cell_size: u32,
+    point_size: u32,
+    /// Scratch: shift powers for M2M and L2L, planar (see shiftPowers). Each
+    /// job works on its own copy of the context.
     dpow: [2 * (MAX_ORDER + 1)]f64,
 
-    /// Dual-tree traversal (TRD 2, "Traversal"): target A receives from source B.
-    fn interact(c: *Ctx, A: u32, B: u32) void {
-        stats.visits += 1;
+    /// Dual-tree traversal (TRD 2, "Traversal"): target A receives from source
+    /// B. In the top traversal (`top`) a call whose target is a cut cell is
+    /// queued for that cell's job instead.
+    fn interact(c: *Ctx, top: bool, A: u32, B: u32) Allocator.Error!void {
+        if (top) {
+            const j = c.fm.job_of[A];
+            if (j != NONE) return c.fm.enqueue(c.a, j, B);
+        }
+        if (track) stats.visits += 1;
         const ca = &c.cells[A];
         if (A == B) {
             if (ca.nchild == 0) {
@@ -291,7 +410,7 @@ const Ctx = struct {
             } else {
                 const c0 = ca.child0;
                 const k = ca.nchild;
-                for (0..k) |i| for (0..k) |j| c.interact(c0 + @as(u32, @intCast(i)), c0 + @as(u32, @intCast(j)));
+                for (0..k) |i| for (0..k) |j| try c.interact(top, c0 + @as(u32, @intCast(i)), c0 + @as(u32, @intCast(j)));
             }
             return;
         }
@@ -315,7 +434,7 @@ const Ctx = struct {
                 if (gap + 2 * (ra + rb) > c.dmax_scaled or gap < c.dmin_scaled) separated = false;
             }
             if (separated) {
-                stats.m2l += 1;
+                if (track) stats.m2l += 1;
                 if (!skip_m2l) c.m2l(A, B, dx, dy);
                 return;
             }
@@ -326,18 +445,18 @@ const Ctx = struct {
             if (!skip_p2p) c.p2p(ca, cb);
         } else if (la or (!lb and rb > ra)) {
             const c0 = cb.child0;
-            for (0..cb.nchild) |j| c.interact(A, c0 + @as(u32, @intCast(j)));
+            for (0..cb.nchild) |j| try c.interact(top, A, c0 + @as(u32, @intCast(j)));
         } else {
             const c0 = ca.child0;
-            for (0..ca.nchild) |i| c.interact(c0 + @as(u32, @intCast(i)), B);
+            for (0..ca.nchild) |i| try c.interact(top, c0 + @as(u32, @intCast(i)), B);
         }
     }
 
     /// Near field, d3's formula, B's points onto A's points, two sources per
     /// step on f64x2 lanes; zero deltas and NaN strengths take the scalar path.
     fn p2p(c: *Ctx, ca: *const Cell, cb: *const Cell) void {
-        stats.p2p_calls += 1;
-        stats.p2p_pairs += @as(u64, ca.count) * cb.count;
+        if (track) stats.p2p_calls += 1;
+        if (track) stats.p2p_pairs += @as(u64, ca.count) * cb.count;
         if (c.has_dmax) {
             for (ca.first..ca.first + ca.count) |ti| c.target(true, @intCast(ti), cb.first, cb.first + cb.count);
         } else {
@@ -346,8 +465,8 @@ const Ctx = struct {
     }
 
     fn p2pSelf(c: *Ctx, ca: *const Cell) void {
-        stats.p2p_calls += 1;
-        stats.p2p_pairs += @as(u64, ca.count) * ca.count;
+        if (track) stats.p2p_calls += 1;
+        if (track) stats.p2p_pairs += @as(u64, ca.count) * ca.count;
         if (c.has_dmax) {
             for (ca.first..ca.first + ca.count) |ti| c.target(true, @intCast(ti), ca.first, ca.first + ca.count);
         } else {
@@ -504,36 +623,61 @@ const Ctx = struct {
     }
 };
 
-/// M_k ← M_k / k! for every cell, so M2L needs no binomials. The multipoles
-/// are not read again after the traversal, so nothing restores them.
-fn scaleForM2l(c: *Ctx) void {
+/// M_k ← M_k / k! for the chunk's cells, so M2L needs no binomials. The
+/// multipoles are not read again after the traversal, so nothing restores
+/// them.
+fn scaleChunk(c: *Ctx, k: u32, _: u32) void {
     const fm = c.fm;
-    for (0..fm.len) |i| {
+    const r = pool.range(fm.len, c.cell_size, k);
+    for (r.lo..r.hi) |i| {
         const q = c.p + 1;
         const mre = fm.m[i * c.stride ..][0..q];
         const mim = fm.m[i * c.stride + q ..][0..q];
-        for (2..q) |k| {
-            const inv = 1 / fm.fact[k];
-            mre[k] *= inv;
-            mim[k] *= inv;
+        for (2..q) |o| {
+            const inv = 1 / fm.fact[o];
+            mre[o] *= inv;
+            mim[o] *= inv;
         }
     }
 }
 
-/// L_l ← (−1)^l L_l / l!, completing the M2L identity.
-fn unscaleAfterM2l(c: *Ctx) void {
+/// L_l ← (−1)^l L_l / l!, completing the M2L identity for cell i.
+fn unscaleCell(c: *Ctx, i: u32) void {
     const fm = c.fm;
-    for (0..fm.len) |i| {
-        const q = c.p + 1;
-        const lre = fm.l[i * c.stride ..][0..q];
-        const lim = fm.l[i * c.stride + q ..][0..q];
-        var sign: f64 = 1;
-        for (0..q) |k| {
-            const inv = sign / fm.fact[k];
-            lre[k] *= inv;
-            lim[k] *= inv;
-            sign = -sign;
-        }
+    const q = c.p + 1;
+    const lre = fm.l[i * c.stride ..][0..q];
+    const lim = fm.l[i * c.stride + q ..][0..q];
+    var sign: f64 = 1;
+    for (0..q) |o| {
+        const inv = sign / fm.fact[o];
+        lre[o] *= inv;
+        lim[o] *= inv;
+        sign = -sign;
+    }
+}
+
+fn zeroChunk(c: *Ctx, k: u32, _: u32) void {
+    const r = pool.range(c.fm.len, c.cell_size, k);
+    @memset(c.fm.m[r.lo * c.stride .. r.hi * c.stride], 0);
+    @memset(c.fm.l[r.lo * c.stride .. r.hi * c.stride], 0);
+}
+
+/// Points into Morton order: raw and scaled positions and strength × alpha,
+/// with NaN strengths contributing nothing (d3's `!quad.value` in effect), so
+/// the kernels need neither per pair.
+fn gatherChunk(c: *Ctx, k: u32, _: u32) void {
+    const fm = c.fm;
+    const r = pool.range(@intCast(c.perm.len), c.point_size, k);
+    for (r.lo..r.hi) |j| {
+        const i = c.perm[j];
+        const x = c.xs[i];
+        const y = c.ys[i];
+        fm.px[j] = x;
+        fm.py[j] = y;
+        const st = c.strengths[i] * c.alpha;
+        fm.ps[j] = if (st != st) 0 else st;
+        fm.ux[j] = (x - c.ox) * c.inv_w;
+        fm.uy[j] = (y - c.oy) * c.inv_w;
     }
 }
 
@@ -572,157 +716,198 @@ fn appendCell(fm: *Fmm, a: Allocator, lo: u32, hi: u32, depth: u32) !void {
     fm.len += 1;
 }
 
-/// Centres and radii from point bounding boxes, leaves first then unions.
-fn geometry(c: *Ctx) void {
+/// Centre and radius of cell i from its points' bounding box, or the union
+/// of its children's.
+fn geometryCell(c: *Ctx, i: u32) void {
     const fm = c.fm;
-    var i = fm.len;
-    while (i > 0) {
-        i -= 1;
-        const cell = &fm.cells[i];
-        var x0: f64 = std.math.inf(f64);
-        var y0: f64 = std.math.inf(f64);
-        var x1: f64 = -std.math.inf(f64);
-        var y1: f64 = -std.math.inf(f64);
-        if (cell.nchild == 0) {
-            for (cell.first..cell.first + cell.count) |k| {
-                const x = c.ux[k];
-                const y = c.uy[k];
-                x0 = @min(x0, x);
-                x1 = @max(x1, x);
-                y0 = @min(y0, y);
-                y1 = @max(y1, y);
-            }
-        } else {
-            for (cell.child0..cell.child0 + cell.nchild) |ch| {
-                x0 = @min(x0, fm.bx0[ch]);
-                x1 = @max(x1, fm.bx1[ch]);
-                y0 = @min(y0, fm.by0[ch]);
-                y1 = @max(y1, fm.by1[ch]);
-            }
+    const cell = &fm.cells[i];
+    var x0: f64 = std.math.inf(f64);
+    var y0: f64 = std.math.inf(f64);
+    var x1: f64 = -std.math.inf(f64);
+    var y1: f64 = -std.math.inf(f64);
+    if (cell.nchild == 0) {
+        for (cell.first..cell.first + cell.count) |k| {
+            const x = c.ux[k];
+            const y = c.uy[k];
+            x0 = @min(x0, x);
+            x1 = @max(x1, x);
+            y0 = @min(y0, y);
+            y1 = @max(y1, y);
         }
-        fm.bx0[i] = x0;
-        fm.by0[i] = y0;
-        fm.bx1[i] = x1;
-        fm.by1[i] = y1;
-        cell.cx = (x0 + x1) / 2;
-        cell.cy = (y0 + y1) / 2;
-        const dx = x1 - x0;
-        const dy = y1 - y0;
-        cell.r = 0.5 * @sqrt(dx * dx + dy * dy);
+    } else {
+        for (cell.child0..cell.child0 + cell.nchild) |ch| {
+            x0 = @min(x0, fm.bx0[ch]);
+            x1 = @max(x1, fm.bx1[ch]);
+            y0 = @min(y0, fm.by0[ch]);
+            y1 = @max(y1, fm.by1[ch]);
+        }
     }
+    fm.bx0[i] = x0;
+    fm.by0[i] = y0;
+    fm.bx1[i] = x1;
+    fm.by1[i] = y1;
+    cell.cx = (x0 + x1) / 2;
+    cell.cy = (y0 + y1) / 2;
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    cell.r = 0.5 * @sqrt(dx * dx + dy * dy);
 }
 
-/// P2M at leaves, M2M into parents (children have larger indices, so a
-/// reverse sweep finishes every child before its parent).
-fn upward(c: *Ctx) void {
+/// P2M at a leaf, M2M from the children otherwise; the children are done.
+fn upwardCell(c: *Ctx, i: u32) void {
     const fm = c.fm;
     const p = c.p;
-    var i = fm.len;
-    while (i > 0) {
-        i -= 1;
-        const cell = &fm.cells[i];
-        const q = p + 1;
-        const mre = fm.m[i * c.stride ..][0..q];
-        const mim = fm.m[i * c.stride + q ..][0..q];
-        if (cell.nchild == 0) {
-            for (cell.first..cell.first + cell.count) |k| {
-                const s = c.ps[k];
-                if (s != s) continue;
-                const zre = c.ux[k] - cell.cx;
-                const zim = c.uy[k] - cell.cy;
-                var pre: f64 = 1;
-                var pim: f64 = 0;
-                mre[0] += s;
-                for (1..q) |o| {
-                    const nre = pre * zre - pim * zim;
-                    const nim = pre * zim + pim * zre;
-                    pre = nre;
-                    pim = nim;
-                    mre[o] += s * pre;
-                    mim[o] += s * pim;
-                }
+    const cell = &fm.cells[i];
+    const q = p + 1;
+    const mre = fm.m[i * c.stride ..][0..q];
+    const mim = fm.m[i * c.stride + q ..][0..q];
+    if (cell.nchild == 0) {
+        for (cell.first..cell.first + cell.count) |k| {
+            const s = c.ps[k];
+            if (s != s) continue;
+            const zre = c.ux[k] - cell.cx;
+            const zim = c.uy[k] - cell.cy;
+            var pre: f64 = 1;
+            var pim: f64 = 0;
+            mre[0] += s;
+            for (1..q) |o| {
+                const nre = pre * zre - pim * zim;
+                const nim = pre * zim + pim * zre;
+                pre = nre;
+                pim = nim;
+                mre[o] += s * pre;
+                mim[o] += s * pim;
             }
-        } else {
-            const dre = c.dpow[0 .. MAX_ORDER + 1];
-            const dim = c.dpow[MAX_ORDER + 1 ..];
-            for (cell.child0..cell.child0 + cell.nchild) |ch| {
-                // M^p_n += Σ_{k ≤ n} M^c_k C(n, k) d^(n − k), d = c_child − c_parent
-                const child = &fm.cells[ch];
-                c.shiftPowers(child.cx - cell.cx, child.cy - cell.cy);
-                const cre = fm.m[ch * c.stride ..][0..q];
-                const cim = fm.m[ch * c.stride + q ..][0..q];
-                for (0..q) |nn| {
-                    var sre: f64 = 0;
-                    var sim: f64 = 0;
-                    for (0..nn + 1) |k| {
-                        const b = fm.bin(nn, k);
-                        const xre = cre[k] * b;
-                        const xim = cim[k] * b;
-                        sre += xre * dre[nn - k] - xim * dim[nn - k];
-                        sim += xre * dim[nn - k] + xim * dre[nn - k];
-                    }
-                    mre[nn] += sre;
-                    mim[nn] += sim;
+        }
+    } else {
+        const dre = c.dpow[0 .. MAX_ORDER + 1];
+        const dim = c.dpow[MAX_ORDER + 1 ..];
+        for (cell.child0..cell.child0 + cell.nchild) |ch| {
+            // M^p_n += Σ_{k ≤ n} M^c_k C(n, k) d^(n − k), d = c_child − c_parent
+            const child = &fm.cells[ch];
+            c.shiftPowers(child.cx - cell.cx, child.cy - cell.cy);
+            const cre = fm.m[ch * c.stride ..][0..q];
+            const cim = fm.m[ch * c.stride + q ..][0..q];
+            for (0..q) |nn| {
+                var sre: f64 = 0;
+                var sim: f64 = 0;
+                for (0..nn + 1) |k| {
+                    const b = fm.bin(nn, k);
+                    const xre = cre[k] * b;
+                    const xim = cim[k] * b;
+                    sre += xre * dre[nn - k] - xim * dim[nn - k];
+                    sim += xre * dim[nn - k] + xim * dre[nn - k];
                 }
+                mre[nn] += sre;
+                mim[nn] += sim;
             }
         }
     }
 }
 
-/// L2L from parents (smaller indices) into children, then L2P at leaves.
-fn downward(c: *Ctx) void {
+/// Geometry and multipoles of a subtree, children before parents.
+fn upSubtree(c: *Ctx, i: u32) void {
+    const cell = c.fm.cells[i];
+    for (cell.child0..cell.child0 + cell.nchild) |ch| upSubtree(c, @intCast(ch));
+    geometryCell(c, i);
+    upwardCell(c, i);
+}
+
+fn upJob(shared: *Ctx, j: u32, _: u32) void {
+    var c = shared.*;
+    upSubtree(&c, c.fm.jobs[j].root);
+}
+
+/// L2L from cell i into its child ch:
+/// L^c_m += Σ_{l ≥ m} L^p_l C(l, m) d^(l − m), d = c_child − c_parent.
+fn l2l(c: *Ctx, i: u32, ch: u32) void {
     const fm = c.fm;
     const p = c.p;
-    for (0..fm.len) |i| {
-        const cell = &fm.cells[i];
-        const q = p + 1;
-        const lre = fm.l[i * c.stride ..][0..q];
-        const lim = fm.l[i * c.stride + q ..][0..q];
-        if (cell.nchild == 0) {
-            for (cell.first..cell.first + cell.count) |k| {
-                // Horner: Φ' = Σ_l L_l w^l, w = u_k − c
-                const j = c.perm[k];
-                const wre = c.ux[k] - cell.cx;
-                const wim = c.uy[k] - cell.cy;
-                var are = lre[p];
-                var aim = lim[p];
-                var l = p;
-                while (l > 0) {
-                    l -= 1;
-                    const nre = are * wre - aim * wim + lre[l];
-                    const nim = are * wim + aim * wre + lim[l];
-                    are = nre;
-                    aim = nim;
-                }
-                // Δv = −α conj(Φ'_z), Φ'_z = Φ'_u / width; α is already in ps.
-                c.vx[j] -= are * c.inv_w;
-                c.vy[j] += aim * c.inv_w;
+    const q = p + 1;
+    const cell = &fm.cells[i];
+    const lre = fm.l[i * c.stride ..][0..q];
+    const lim = fm.l[i * c.stride + q ..][0..q];
+    const dre = c.dpow[0 .. MAX_ORDER + 1];
+    const dim = c.dpow[MAX_ORDER + 1 ..];
+    const child = &fm.cells[ch];
+    c.shiftPowers(child.cx - cell.cx, child.cy - cell.cy);
+    const cre = fm.l[ch * c.stride ..][0..q];
+    const cim = fm.l[ch * c.stride + q ..][0..q];
+    for (0..q) |mm| {
+        var sre: f64 = 0;
+        var sim: f64 = 0;
+        for (mm..q) |l| {
+            const b = fm.bin(l, mm);
+            const xre = lre[l] * b;
+            const xim = lim[l] * b;
+            sre += xre * dre[l - mm] - xim * dim[l - mm];
+            sim += xre * dim[l - mm] + xim * dre[l - mm];
+        }
+        cre[mm] += sre;
+        cim[mm] += sim;
+    }
+}
+
+/// The downward step of cell i: L2P at a leaf, else L2L into each child,
+/// except, in the top part (`top`), into the cut cells, whose jobs do it.
+fn downwardCell(c: *Ctx, comptime top: bool, i: u32) void {
+    const fm = c.fm;
+    const p = c.p;
+    const cell = &fm.cells[i];
+    const q = p + 1;
+    const lre = fm.l[i * c.stride ..][0..q];
+    const lim = fm.l[i * c.stride + q ..][0..q];
+    if (cell.nchild == 0) {
+        for (cell.first..cell.first + cell.count) |k| {
+            // Horner: Φ' = Σ_l L_l w^l, w = u_k − c
+            const j = c.perm[k];
+            const wre = c.ux[k] - cell.cx;
+            const wim = c.uy[k] - cell.cy;
+            var are = lre[p];
+            var aim = lim[p];
+            var l = p;
+            while (l > 0) {
+                l -= 1;
+                const nre = are * wre - aim * wim + lre[l];
+                const nim = are * wim + aim * wre + lim[l];
+                are = nre;
+                aim = nim;
             }
-        } else {
-            const dre = c.dpow[0 .. MAX_ORDER + 1];
-            const dim = c.dpow[MAX_ORDER + 1 ..];
-            for (cell.child0..cell.child0 + cell.nchild) |ch| {
-                // L^c_m += Σ_{l ≥ m} L^p_l C(l, m) d^(l − m), d = c_child − c_parent
-                const child = &fm.cells[ch];
-                c.shiftPowers(child.cx - cell.cx, child.cy - cell.cy);
-                const cre = fm.l[ch * c.stride ..][0..q];
-                const cim = fm.l[ch * c.stride + q ..][0..q];
-                for (0..q) |mm| {
-                    var sre: f64 = 0;
-                    var sim: f64 = 0;
-                    for (mm..q) |l| {
-                        const b = fm.bin(l, mm);
-                        const xre = lre[l] * b;
-                        const xim = lim[l] * b;
-                        sre += xre * dre[l - mm] - xim * dim[l - mm];
-                        sim += xre * dim[l - mm] + xim * dre[l - mm];
-                    }
-                    cre[mm] += sre;
-                    cim[mm] += sim;
-                }
-            }
+            // Δv = −α conj(Φ'_z), Φ'_z = Φ'_u / width; α is already in ps.
+            c.vx[j] -= are * c.inv_w;
+            c.vy[j] += aim * c.inv_w;
+        }
+    } else {
+        for (cell.child0..cell.child0 + cell.nchild) |ch| {
+            if (top and fm.job_of[ch] != NONE) continue;
+            l2l(c, i, @intCast(ch));
         }
     }
+}
+
+fn unscaleSubtree(c: *Ctx, i: u32) void {
+    unscaleCell(c, i);
+    const cell = c.fm.cells[i];
+    for (cell.child0..cell.child0 + cell.nchild) |ch| unscaleSubtree(c, @intCast(ch));
+}
+
+/// Parents before children, as the serial downward pass in level order.
+fn downSubtree(c: *Ctx, i: u32) void {
+    downwardCell(c, false, i);
+    const cell = c.fm.cells[i];
+    for (cell.child0..cell.child0 + cell.nchild) |ch| downSubtree(c, @intCast(ch));
+}
+
+/// A job: its deferred calls in order, then unscale, the parent's L2L into
+/// its root, and the downward pass over its subtree.
+fn downJob(shared: *Ctx, j: u32, _: u32) void {
+    var c = shared.*;
+    const fm = c.fm;
+    const job = fm.jobs[j];
+    for (fm.queue_b[job.q_first..][0..job.q_count]) |b| c.interact(false, job.root, b) catch unreachable;
+    unscaleSubtree(&c, job.root);
+    if (job.parent != NONE) l2l(&c, job.parent, job.root);
+    downSubtree(&c, job.root);
 }
 
 test "fast many-body matches the direct sum to the stated bound" {

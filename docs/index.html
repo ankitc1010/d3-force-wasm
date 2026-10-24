@@ -19,7 +19,7 @@
       "d3-dispatch": "/node_modules/d3-dispatch/src/index.js",
       "d3-timer": "/node_modules/d3-timer/src/index.js"
     } : {
-      "d3-force-wasm": cdn + "d3-force-wasm@0.2.0/src/index.js",
+      "d3-force-wasm": cdn + "d3-force-wasm@0.3.0/src/index.js",
       "d3-force": cdn + "d3-force@3.0.0/src/index.js",
       "d3-quadtree": cdn + "d3-quadtree@3.0.1/src/index.js",
       "d3-dispatch": cdn + "d3-dispatch@3.0.1/src/index.js",
@@ -29,7 +29,7 @@
     s.type = "importmap";
     s.textContent = JSON.stringify({imports: imports});
     document.currentScript.after(s);
-    window.D3FW_SOURCE = local ? "local build" : "d3-force-wasm@0.2.0 from npm";
+    window.D3FW_SOURCE = local ? "local build" : "d3-force-wasm@0.3.0 from npm";
   })();
 </script>
 <style>
@@ -114,6 +114,12 @@
         <option value="fast">fast (O(n) multipole)</option>
       </select>
     </label>
+    <label>Threads
+      <select id="threads">
+        <option value="auto" selected>auto</option>
+        <option value="0">one thread</option>
+      </select>
+    </label>
     <label><input type="checkbox" id="links" checked> Draw links</label>
     <button id="restart" class="primary">Restart</button>
     <button id="pause">Pause</button>
@@ -123,6 +129,7 @@
     <span>Speed-up <b id="speedup">–</b></span>
     <span>Tick <b id="tick">0</b></span>
     <span>Output <b id="parity">–</b></span>
+    <span>Workers <b id="workers">–</b></span>
   </div>
 
   <div class="stage">

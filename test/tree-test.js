@@ -7,8 +7,11 @@ import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import {pointSets, trace, bits, unbits} from "../scripts/tree-traces.js";
 
-const wasm = readFileSync(new URL("../zig-out/bin/core.wasm", import.meta.url));
-const core = new WebAssembly.Instance(new WebAssembly.Module(wasm), {env: {random: Math.random}}).exports;
+// The introspection exports are in core-mt.wasm only (src/core/root.zig); with
+// no workers started, its tree build runs every phase inline.
+const wasm = readFileSync(new URL("../zig-out/bin/core-mt.wasm", import.meta.url));
+const memory = new WebAssembly.Memory({initial: 32, maximum: 16384, shared: true});
+const core = new WebAssembly.Instance(new WebAssembly.Module(wasm), {env: {memory, random: Math.random, now: () => performance.now()}}).exports;
 const traces = JSON.parse(readFileSync(new URL("./fixtures/tree-traces.json", import.meta.url)));
 const NONE = 0xffffffff;
 
@@ -18,8 +21,8 @@ function coreTrace(x, y) {
   const h = core.sim_create();
   assert.ok(h);
   assert.ok(core.sim_set_node_count(h, n) >= 0);
-  new Float64Array(core.memory.buffer, core.sim_ptr(h, 0), n).set(x);
-  new Float64Array(core.memory.buffer, core.sim_ptr(h, 1), n).set(y);
+  new Float64Array(memory.buffer, core.sim_ptr(h, 0), n).set(x);
+  new Float64Array(memory.buffer, core.sim_ptr(h, 1), n).set(y);
   assert.ok(core.tree_build(h, 0) >= 0);
 
   const len = core.tree_info(h, 0), root = core.tree_info(h, 1), size = core.tree_info(h, 5);
@@ -29,7 +32,7 @@ function coreTrace(x, y) {
   core.free(out, Math.max(len, 1) * 4);
 
   // Views are made after the last call that may allocate.
-  const mem = core.memory.buffer;
+  const mem = memory.buffer;
   const cells = new DataView(mem, core.tree_info(h, 2), len * size);
   const perm = new Uint32Array(mem, core.tree_info(h, 4), core.tree_info(h, 6));
   const extent = [...new Float64Array(mem, core.tree_info(h, 3), 4)].map(bits);
@@ -65,7 +68,7 @@ function coreTrace(x, y) {
 
 function order(h, after, out, len) {
   assert.equal(core.tree_order(h, after, out), 0);
-  return [...new Uint32Array(core.memory.buffer, out, len)];
+  return [...new Uint32Array(memory.buffer, out, len)];
 }
 
 function compare(name, ref, got) {
@@ -91,8 +94,8 @@ test("tree build reuses memory across rebuilds and node-count changes", () => {
   const h = core.sim_create();
   for (const n of [10, 1000, 50, 5000, 5000]) {
     core.sim_set_node_count(h, n);
-    const x = new Float64Array(core.memory.buffer, core.sim_ptr(h, 0), n);
-    const y = new Float64Array(core.memory.buffer, core.sim_ptr(h, 1), n);
+    const x = new Float64Array(memory.buffer, core.sim_ptr(h, 0), n);
+    const y = new Float64Array(memory.buffer, core.sim_ptr(h, 1), n);
     for (let i = 0; i < n; ++i) x[i] = Math.sin(i) * 100, y[i] = Math.cos(i * 1.3) * 100;
     assert.ok(core.tree_build(h, 0) >= 0);
     assert.equal(core.tree_info(h, 6), n);

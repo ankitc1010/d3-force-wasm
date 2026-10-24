@@ -1,4 +1,6 @@
-// Minimal static server for the demo, with no dependencies.
+// Minimal static server for the demo, with no dependencies. It sends the
+// cross-origin isolation headers, so the local demo can run threads (TRD 3);
+// everything it serves is same-origin, as require-corp needs.
 //
 //   npm run demo        builds the core, then serves http://localhost:8080/docs/
 
@@ -19,7 +21,12 @@ createServer(async (req, res) => {
   if (!file.startsWith(root.endsWith(sep) ? root : root + sep)) return void res.writeHead(403).end();
   try {
     const body = await readFile(file);
-    res.writeHead(200, {"content-type": types[extname(file)] || "application/octet-stream", "cache-control": "no-store"}).end(body);
+    res.writeHead(200, {
+      "content-type": types[extname(file)] || "application/octet-stream",
+      "cache-control": "no-store",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-embedder-policy": "require-corp"
+    }).end(body);
   } catch {
     res.writeHead(404).end("not found");
   }

@@ -1,12 +1,15 @@
 //! Exported ABI of the core (TRD, Zig core design: "Exported ABI"). Flat and
 //! C-style: every export takes a simulation handle and integers or f64 and
-//! returns an i32 status or an index. Nothing is imported but memory.
+//! returns an i32 status or an index. core.wasm imports only `env.random`;
+//! core-mt.wasm also imports its shared memory and `env.now` and exports the
+//! pool (TRD 3, Design).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const sim_mod = @import("sim.zig");
 const tree_mod = @import("tree.zig");
 const force_mod = @import("force.zig");
+const pool = @import("pool.zig");
 const Sim = sim_mod.Sim;
 const Force = force_mod.Force;
 
@@ -18,9 +21,10 @@ pub const Status = enum(i32) {
     bad_handle = -1,
     out_of_memory = -2,
     bad_argument = -3,
+    worker_failed = -4,
 };
 
-const gpa: std.mem.Allocator = if (builtin.target.cpu.arch.isWasm()) std.heap.wasm_allocator else std.heap.page_allocator;
+const gpa: std.mem.Allocator = if (builtin.target.cpu.arch.isWasm()) @import("alloc.zig").allocator else std.heap.page_allocator;
 
 /// Handle h refers to sims[h - 1]; 0 is never a valid handle.
 var sims: []?*Sim = &.{};
@@ -34,12 +38,25 @@ fn status(s: Status) i32 {
     return @intFromEnum(s);
 }
 
-export fn alloc(bytes: u32) u32 {
+/// The status for a kernel error.
+fn failure(e: anyerror) i32 {
+    return status(switch (e) {
+        error.BadArgument => .bad_argument,
+        error.WorkerFailed => .worker_failed,
+        else => .out_of_memory,
+    });
+}
+
+// Test-only exports (alloc, free, tree_build, tree_info, tree_order) are in
+// core-mt.wasm alone, which keeps them out of the install budget; the tree
+// tests load that core without workers, where every phase runs inline.
+
+fn alloc(bytes: u32) callconv(.c) u32 {
     const mem = gpa.alignedAlloc(u8, .@"16", bytes) catch return 0;
     return @intCast(@intFromPtr(mem.ptr));
 }
 
-export fn free(p: u32, bytes: u32) void {
+fn free(p: u32, bytes: u32) callconv(.c) void {
     if (p == 0) return;
     const mem: [*]align(16) u8 = @ptrFromInt(p);
     gpa.free(mem[0..bytes]);
@@ -82,18 +99,18 @@ export fn sim_ptr(h: u32, which: u32) u32 {
 
 /// Builds the tree on positions (`shifted` = 0) or on x + vx, y + vy (1).
 /// Returns GROWN when the build reallocated, so views must be refreshed.
-export fn tree_build(h: u32, shifted: u32) i32 {
+fn tree_build(h: u32, shifted: u32) callconv(.c) i32 {
     const s = get(h) orelse return status(.bad_handle);
     const cells_before = s.tree.cells.ptr;
     const perm_before = s.tree.perm.ptr;
-    s.buildTree(gpa, shifted != 0) catch return status(.out_of_memory);
+    s.buildTree(gpa, shifted != 0) catch |e| return failure(e);
     return status(if (s.tree.cells.ptr != cells_before or s.tree.perm.ptr != perm_before) .grown else .ok);
 }
 
 /// Tree introspection for the facade and the trace tests.
 /// 0 cell count, 1 root, 2 cells ptr, 3 extent ptr (4 × f64), 4 perm ptr,
 /// 5 sizeof(Cell), 6 points in tree.
-export fn tree_info(h: u32, which: u32) u32 {
+fn tree_info(h: u32, which: u32) callconv(.c) u32 {
     const s = get(h) orelse return 0;
     const t = &s.tree;
     return switch (which) {
@@ -110,7 +127,7 @@ export fn tree_info(h: u32, which: u32) u32 {
 
 /// Writes cell indices in d3-quadtree callback order to `out` (cell count × u32):
 /// `after` = 0 for `visit`, 1 for `visitAfter`.
-export fn tree_order(h: u32, after: u32, out: u32) i32 {
+fn tree_order(h: u32, after: u32, out: u32) callconv(.c) i32 {
     const s = get(h) orelse return status(.bad_handle);
     const t = &s.tree;
     if (out == 0) return status(.bad_argument);
@@ -176,37 +193,52 @@ export fn force_set_scalar(h: u32, fh: u32, which: u32, v: f64) i32 {
     return status(.ok);
 }
 
+export fn force_get_scalar(h: u32, fh: u32, which: u32) f64 {
+    const s = get(h) orelse return 0;
+    const f = s.getForce(fh) orelse return 0;
+    return if (which < f.scalars.len) f.scalars[which] else 0;
+}
+
+/// Saves vx, vy (and x, y when `positions` is 1) before a threaded step;
+/// `sim_ptr(h, 9)` points at them: vx, vy, x, y, n entries each. In
+/// core-mt.wasm only, the one core whose steps can fail.
+fn sim_snapshot(h: u32, positions: u32) callconv(.c) i32 {
+    const s = get(h) orelse return status(.bad_handle);
+    s.snapshot(gpa, positions != 0) catch return status(.out_of_memory);
+    return status(.ok);
+}
+
 export fn force_run(h: u32, fh: u32, alpha: f64) i32 {
     const s = get(h) orelse return status(.bad_handle);
     const f = s.getForce(fh) orelse return status(.bad_handle);
     if (f.nodeSized() and f.count < s.n) return status(.bad_argument);
+    runForce(s, f, alpha) catch |e| return failure(e);
+    return status(.ok);
+}
+
+fn runForce(s: *Sim, f: *Force, alpha: f64) !void {
     switch (f.kind) {
         .center => @import("simple.zig").center(s, f),
-        .x => @import("simple.zig").axis(s, f, alpha, 0),
-        .y => @import("simple.zig").axis(s, f, alpha, 1),
-        .radial => @import("simple.zig").radial(s, f, alpha),
+        .x => try @import("simple.zig").axis(s, f, alpha, 0),
+        .y => try @import("simple.zig").axis(s, f, alpha, 1),
+        .radial => try @import("simple.zig").radial(s, f, alpha),
         .link => {
             if (fastMode(s, f)) {
-                @import("link_fast.zig").run(s, gpa, f, alpha) catch |e| return status(if (e == error.BadArgument) .bad_argument else .out_of_memory);
-            } else @import("link.zig").run(s, f, alpha, &jsRandom) catch return status(.bad_argument);
+                try @import("link_fast.zig").run(s, gpa, f, alpha);
+            } else try @import("link.zig").run(s, f, alpha, &jsRandom);
         },
         .many_body => {
             // Fast mode: FMM at or above the crossover; the exact kernel otherwise,
             // or when the FMM declines a degenerate extent (TRD 2).
-            const fmm = @import("fmm.zig");
-            var done = false;
-            if (fastMode(s, f)) {
-                done = fmm.run(s, gpa, f, alpha) catch return status(.out_of_memory);
-            }
-            if (!done) @import("many_body.zig").run(s, gpa, f, alpha, &jsRandom) catch return status(.out_of_memory);
+            if (fastMode(s, f) and try @import("fmm.zig").run(s, gpa, f, alpha)) return;
+            try @import("many_body.zig").run(s, gpa, f, alpha, &jsRandom);
         },
         .collide => {
             if (fastMode(s, f)) {
-                @import("grid.zig").run(s, gpa, f, alpha) catch return status(.out_of_memory);
-            } else @import("collide.zig").run(s, gpa, f, &jsRandom) catch return status(.out_of_memory);
+                try @import("grid.zig").run(s, gpa, f, alpha);
+            } else try @import("collide.zig").run(s, gpa, f, &jsRandom);
         },
     }
-    return status(.ok);
 }
 
 /// Fast mode applies at or above the crossover node count (TRD 2); below it
@@ -217,8 +249,69 @@ fn fastMode(s: *const Sim, f: *const Force) bool {
 
 export fn sim_integrate(h: u32, velocity_decay: f64) i32 {
     const s = get(h) orelse return status(.bad_handle);
-    @import("simple.zig").integrate(s, velocity_decay);
+    @import("simple.zig").integrate(s, velocity_decay) catch |e| return failure(e);
     return status(.ok);
+}
+
+/// Test and benchmark knobs (pool.tune), in core-mt.wasm only: chunk sizes
+/// never change results, and without the export the inlined core folds the
+/// test overrides away.
+fn pool_tune(which: u32, v: f64) callconv(.c) void {
+    pool.tune(which, v);
+}
+
+// The pool's exports, in core-mt.wasm only (TRD 3, Design).
+const pool_exports = if (pool.threaded) struct {
+    /// Allocates the regions of k workers; returns the first region, or 0.
+    fn pool_init(k: u32) callconv(.c) u32 {
+        return pool.mt.init(gpa, k);
+    }
+    fn pool_hold(delta: i32) callconv(.c) void {
+        pool.mt.hold(delta);
+    }
+    /// Sets the workers taking part in later phases; returns the previous value.
+    fn pool_set_active(a: u32) callconv(.c) u32 {
+        return pool.mt.setActive(a);
+    }
+    fn pool_retire() callconv(.c) void {
+        pool.mt.retire();
+    }
+    /// 0 workers, 1 failed tid (64 = timeout), 2 address of the failed flag,
+    /// 3 region size, 4 active workers.
+    fn pool_info(which: u32) callconv(.c) u32 {
+        return switch (which) {
+            0 => pool.mt.workers,
+            1 => @atomicLoad(u32, &pool.mt.slot.failed, .seq_cst),
+            2 => @intCast(@intFromPtr(&pool.mt.slot.failed)),
+            3 => pool.REGION,
+            4 => pool.mt.slot.active,
+            else => 0,
+        };
+    }
+    /// 0 phases dispatched, 1 ms the main thread waited for check-ins.
+    fn pool_stat(which: u32) callconv(.c) f64 {
+        return switch (which) {
+            0 => pool.mt.phases,
+            1 => pool.mt.wait_ms,
+            else => 0,
+        };
+    }
+} else struct {};
+
+comptime {
+    if (pool.threaded) {
+        @export(&alloc, .{ .name = "alloc" });
+        @export(&pool_tune, .{ .name = "pool_tune" });
+        @export(&sim_snapshot, .{ .name = "sim_snapshot" });
+        @export(&free, .{ .name = "free" });
+        @export(&tree_build, .{ .name = "tree_build" });
+        @export(&tree_info, .{ .name = "tree_info" });
+        @export(&tree_order, .{ .name = "tree_order" });
+        @export(&pool.mt.workerStart, .{ .name = "worker_start" });
+        for (.{ "pool_init", "pool_hold", "pool_set_active", "pool_retire", "pool_info", "pool_stat" }) |name| {
+            @export(&@field(pool_exports, name), .{ .name = name });
+        }
+    }
 }
 
 test {

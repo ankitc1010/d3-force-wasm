@@ -38,6 +38,8 @@ pub const Force = struct {
     /// Fast link's adjacency (link_fast.zig); empty until first used.
     csr_ptr: []u32 = &.{},
     csr_adj: []u32 = &.{},
+    /// The node count the adjacency was built for; 0 once the links change.
+    csr_n: u32 = 0,
 
     pub fn deinit(f: *Force, a: Allocator) void {
         inline for (.{ "f0", "f1", "f2", "source", "target", "csr_ptr", "csr_adj" }) |name| a.free(@field(f, name));
@@ -76,6 +78,7 @@ pub const Force = struct {
             }
         }
         f.count = count;
+        f.csr_n = 0;
     }
 
     /// An empty slice's pointer is only an alignment dummy, so it reads as 0.

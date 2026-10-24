@@ -34,7 +34,19 @@ function build(lib, n, preset, mode) {
   if (preset !== "charge") sim.force("link", lib.forceLink(links)).force("center", lib.forceCenter());
   if (preset === "collide") sim.force("collide", lib.forceCollide(3));
   if (mode === "fast" && sim.precision) sim.precision("fast");
+  // Threads (0.3+): "auto" uses every core where the page is isolated.
+  if (sim.threads) sim.threads($("threads").value === "auto" ? null : 0);
   return {sim, nodes, links};
+}
+
+// Workers the wasm side's last tick used, and why it is 0 when it is.
+function workers(sim) {
+  if (!sim.threads) return "– (this version has no threads)";
+  const k = sim.threads();
+  if (k) return `${k} + main thread`;
+  if (!globalThis.crossOriginIsolated) return "0 (page not cross-origin isolated)";
+  if ($("threads").value === "0") return "0 (one thread selected)";
+  return +$("n").value < 2000 ? "0 (below 2,000 nodes)" : "0 (starting…)";
 }
 
 // RMS distance between the two layouts, relative to the reference's extent.
@@ -161,6 +173,7 @@ function loop() {
   if (!both) parity.textContent = "– (one side off)", parity.className = "";
   else if (s.mode === "fast") parity.textContent = `fast: ${pct(s.dev)} of extent from d3`, parity.className = "";
   else parity.textContent = s.diverged ? `diverged at tick ${s.diverged}` : "bit-identical", parity.className = s.diverged ? "bad" : "ok";
+  $("workers").textContent = wasmOn ? workers(s.b.sim) : "–";
 
   if (running && !paused) frame = requestAnimationFrame(loop);
 }
@@ -179,6 +192,7 @@ $("restart").onclick = start;
 $("n").onchange = start;
 $("forces").onchange = start;
 $("mode").onchange = start;
+$("threads").onchange = start;
 $("pause").onclick = () => {
   paused = !paused;
   $("pause").textContent = paused ? "Resume" : "Pause";

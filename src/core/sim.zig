@@ -8,9 +8,10 @@ const Fmm = @import("fmm.zig").Fmm;
 const Grid = @import("grid.zig").Grid;
 const Force = @import("force.zig").Force;
 const addr = @import("force.zig").addr;
+const pool = @import("pool.zig");
 
 /// Indices for `sim_ptr`.
-pub const Ptr = enum(u32) { x, y, vx, vy, fx, fy, fixed, perm, rng_buf };
+pub const Ptr = enum(u32) { x, y, vx, vy, fx, fy, fixed, perm, rng_buf, snap };
 
 pub const Sim = struct {
     n: u32 = 0,
@@ -26,6 +27,12 @@ pub const Sim = struct {
     /// Scratch for trees built on shifted positions (collide uses x + vx).
     px: []f64 = &.{},
     py: []f64 = &.{},
+    /// vx, vy (then x, y) as they were before the last threaded step, so a
+    /// failed step can run again on the inlined core (TRD 3, "Failure").
+    snap: []f64 = &.{},
+    /// Nodes the exact many-body traversal left for the jiggle rerun; all
+    /// zero between runs.
+    flags: []u8 = &.{},
     tree: Tree = .{},
     /// Fast many-body tree and expansions (fmm.zig).
     fmm: Fmm = .{},
@@ -35,7 +42,7 @@ pub const Sim = struct {
     forces: []?*Force = &.{},
 
     pub fn deinit(s: *Sim, a: Allocator) void {
-        inline for (.{ "x", "y", "vx", "vy", "fx", "fy", "fixed", "px", "py" }) |f| a.free(@field(s, f));
+        inline for (.{ "x", "y", "vx", "vy", "fx", "fy", "fixed", "px", "py", "snap", "flags" }) |f| a.free(@field(s, f));
         s.tree.deinit(a);
         s.fmm.deinit(a);
         s.grid.deinit(a);
@@ -76,7 +83,20 @@ pub const Sim = struct {
             .fixed => addr(s.fixed),
             .perm => addr(s.tree.perm),
             .rng_buf => 0,
+            .snap => addr(s.snap),
         };
+    }
+
+    /// Copies vx and vy, and x and y when `positions`, into `snap`.
+    pub fn snapshot(s: *Sim, a: Allocator, positions: bool) !void {
+        const n = s.n;
+        if (s.snap.len < 4 * n) s.snap = try a.realloc(s.snap, 4 * @as(usize, s.cap));
+        @memcpy(s.snap[0..n], s.vx[0..n]);
+        @memcpy(s.snap[n .. 2 * n], s.vy[0..n]);
+        if (positions) {
+            @memcpy(s.snap[2 * n .. 3 * n], s.x[0..n]);
+            @memcpy(s.snap[3 * n .. 4 * n], s.y[0..n]);
+        }
     }
 
     pub fn getForce(s: *Sim, fh: u32) ?*Force {
@@ -96,16 +116,32 @@ pub const Sim = struct {
 
     /// Builds the shared tree on (x, y), or on (x + vx, y + vy) when `shifted`.
     pub fn buildTree(s: *Sim, a: Allocator, shifted: bool) !void {
-        @setFloatMode(.strict);
         const n = s.n;
         if (shifted) {
-            for (0..n) |i| {
-                s.px[i] = s.x[i] + s.vx[i];
-                s.py[i] = s.y[i] + s.vy[i];
-            }
+            try s.shift();
             try s.tree.build(a, s.px[0..n], s.py[0..n]);
         } else {
             try s.tree.build(a, s.x[0..n], s.y[0..n]);
         }
+    }
+
+    /// px = x + vx, py = y + vy, in static chunks.
+    pub fn shift(s: *Sim) pool.Error!void {
+        const K = struct {
+            s: *Sim,
+            size: u32,
+            fn chunk(k: *const @This(), c: u32, _: u32) void {
+                @setFloatMode(.strict);
+                const r = pool.range(k.s.n, k.size, c);
+                const sim = k.s;
+                for (r.lo..r.hi) |i| {
+                    sim.px[i] = sim.x[i] + sim.vx[i];
+                    sim.py[i] = sim.y[i] + sim.vy[i];
+                }
+            }
+        };
+        const size = pool.chunkSize(16384);
+        const k = K{ .s = s, .size = size };
+        try pool.parallelFor(&k, pool.chunks(s.n, size), K.chunk);
     }
 };

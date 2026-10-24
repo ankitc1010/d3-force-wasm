@@ -10,6 +10,7 @@ const a = std.testing.allocator;
 test {
     _ = @import("fmm.zig");
     _ = @import("hash.zig");
+    _ = @import("sort.zig");
 }
 
 test "empty and all-NaN inputs give an empty tree" {
@@ -173,7 +174,7 @@ test "integrate applies the fixed-position rule per axis" {
     }
     s.fixed[0] = 0;
     s.fixed[1] = 2; // fy only
-    @import("simple.zig").integrate(&s, 0.5);
+    try @import("simple.zig").integrate(&s, 0.5);
     try std.testing.expectEqualSlices(f64, &.{ 6, 6 }, s.x[0..2]);
     try std.testing.expectEqualSlices(f64, &.{ 5, 5 }, s.vx[0..2]);
     try std.testing.expectEqualSlices(f64, &.{ 12, -6 }, s.y[0..2]);

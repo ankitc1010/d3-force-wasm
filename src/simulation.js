@@ -26,7 +26,9 @@ export default function(nodes) {
       event = dispatch("tick", "end"),
       random = lcg(),
       precision = "exact",
-      fastOptions = null; // {order, opening} while precision is "fast"
+      fastOptions = null, // {order, opening} while precision is "fast"
+      threads = null, // most workers a tick may use; null = auto (TRD 3)
+      workersUsed = 0;
 
   if (nodes == null) nodes = [];
 
@@ -42,15 +44,19 @@ export default function(nodes) {
   // d3's tick with the per-node loops in the core. Positions are copied in
   // once, native forces run back to back on the core's arrays, a custom force
   // sees the node objects through a copy-out and copy-in around it, and the
-  // result is copied out once at the end.
+  // result is copied out once at the end. On the threaded core, `hold` keeps
+  // the workers spinning for the whole tick (TRD 3, Facade: "Per tick").
   function tick(iterations) {
-    var ctx, k;
+    var ctx, k, core, active;
 
     if (iterations === undefined) iterations = 1;
     if (!(0 < iterations)) return simulation;
 
     ctx = context(nodes);
     ctx.precision = fastOptions;
+    workersUsed = ctx.engage(nodes.length, threads);
+    core = ctx.core;
+    if (core.threaded) active = core.exports.pool_set_active(workersUsed), core.exports.pool_hold(1);
     ctx.copyIn(nodes);
     ctx.live = true;
     try {
@@ -75,6 +81,8 @@ export default function(nodes) {
     } finally {
       ctx.live = false;
       ctx.copyOut(nodes);
+      if (core.threaded) core.exports.pool_hold(-1), core.exports.pool_set_active(active);
+      if (!ctx.core.threaded) workersUsed = 0;
     }
 
     return simulation;
@@ -187,6 +195,18 @@ export default function(nodes) {
         opening: Math.max(1.01, +(options && options.opening) || 1.5)
       } : null;
       context(nodes).precision = fastOptions;
+      return simulation;
+    }
+  });
+
+  // threads(k) caps the workers a tick may use: 0 keeps the simulation on one
+  // thread, null restores auto. The getter returns the workers the last tick
+  // used: 0 below the threshold, without the pool, or after a failure (TRD 3).
+  Object.defineProperty(simulation, "threads", {
+    configurable: true, writable: true, enumerable: false,
+    value: function(k) {
+      if (!arguments.length) return workersUsed;
+      threads = k == null ? null : Math.max(0, Math.floor(+k) || 0);
       return simulation;
     }
   });

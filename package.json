@@ -1,6 +1,6 @@
 {
   "name": "d3-force-wasm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Drop-in, bit-exact replacement for d3-force v3 with a Zig/WebAssembly core.",
   "keywords": [
     "d3",
@@ -39,6 +39,7 @@
   },
   "files": [
     "src/**/*.js",
+    "src/core-mt.wasm",
     "index.d.ts"
   ],
   "sideEffects": false,
@@ -54,8 +55,10 @@
     "traces": "node scripts/tree-traces.js",
     "demo": "npm run build:wasm && node scripts/serve.js",
     "prepack": "npm run build:wasm",
-    "prepublishOnly": "npm test",
-    "test:fast": "node --test test/fast/*-test.js"
+    "prepublishOnly": "npm test && npm run test:threads",
+    "test:fast": "node --test test/fast/*-test.js",
+    "test:threads": "node --test test/threads/*-test.js",
+    "bench:threads": "node bench/threads.js"
   },
   "peerDependencies": {
     "@types/d3-force": "^3.0.0"

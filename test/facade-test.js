@@ -110,7 +110,8 @@ test("on() getters, typename lists and d3-dispatch errors", () => {
 });
 
 test("exports and accessors mirror d3-force", () => {
-  assert.deepEqual(Object.keys(wasm).sort(), Object.keys(d3).sort());
+  // d3-force's exports, plus the documented extensions (TRD 2, Public API).
+  assert.deepEqual(Object.keys(wasm).sort(), [...Object.keys(d3), "configure"].sort());
   const a = d3.forceManyBody().theta(0.5).distanceMin(2).distanceMax(9);
   const b = wasm.forceManyBody().theta(0.5).distanceMin(2).distanceMax(9);
   assert.deepEqual([b.theta(), b.distanceMin(), b.distanceMax()], [a.theta(), a.distanceMin(), a.distanceMax()]);
